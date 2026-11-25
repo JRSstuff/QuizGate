@@ -9,6 +9,8 @@ export async function GET() {
     {
       status: "ok",
       app: "QuizGate",
+      supabasePublicConfigured: isSupabasePublicConfigured(),
+      supabaseServiceConfigured: isSupabaseServiceConfigured(),
       supabaseConfigured:
         isSupabasePublicConfigured() && isSupabaseServiceConfigured(),
       server_time: Date.now(),

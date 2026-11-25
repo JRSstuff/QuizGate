@@ -1,11 +1,9 @@
-import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient } from "@/utils/supabase/client";
+import { isSupabasePublicEnvConfigured } from "@/utils/supabase/env";
 
 export function isSupabasePublicConfigured(): boolean {
-  return Boolean(
-    process.env.NEXT_PUBLIC_SUPABASE_URL &&
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-  );
+  return isSupabasePublicEnvConfigured();
 }
 
 let cachedBrowserClient: SupabaseClient | null = null;
@@ -15,10 +13,7 @@ export function getSupabaseBrowserClient(): SupabaseClient | null {
   if (!isSupabasePublicConfigured()) return null;
 
   if (!cachedBrowserClient) {
-    cachedBrowserClient = createBrowserClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    );
+    cachedBrowserClient = createClient();
   }
   return cachedBrowserClient;
 }

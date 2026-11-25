@@ -18,6 +18,7 @@ import {
   WifiOff,
 } from "lucide-react";
 import { offlineDb, type ActiveSession } from "@/lib/offline/storage";
+import { getSupabaseBrowserClient } from "@/lib/supabase/config";
 
 interface AppShellProps {
   children: React.ReactNode;
@@ -112,8 +113,12 @@ export function AppShell({
   };
 
   const handleSignOut = async () => {
+    const wasSupabase = session?.authMode === "supabase";
     if (offlineDb) {
       await offlineDb.session.delete("active");
+    }
+    if (wasSupabase && navigator.onLine) {
+      getSupabaseBrowserClient()?.auth.signOut().catch(() => {});
     }
     setSession(null);
     window.dispatchEvent(new CustomEvent("qg:session-updated"));

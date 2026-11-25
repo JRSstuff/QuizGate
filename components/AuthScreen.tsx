@@ -379,7 +379,11 @@ function AuthScreenInner() {
             options: { data: { name: teacherName.trim() || cleanEmail.split("@")[0] } },
           });
           if (signUpErr) throw signUpErr;
-          if (!data.user) throw new Error("Registration succeeded; check your email to confirm.");
+          if (!data.user || !data.session) {
+            throw new Error(
+              "Teacher account created! Check your email inbox to confirm your address before signing in (or disable 'Confirm email' in Supabase Auth -> Providers -> Email)."
+            );
+          }
           await offlineDb.session.put({
             key: "active",
             role: "teacher",

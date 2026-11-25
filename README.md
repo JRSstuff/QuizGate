@@ -45,11 +45,11 @@ QuizGate is an offline-first classroom quiz and Grade 10 Quarter 2 Mathematics P
 
 ```bash
 npm install
-cp .env.example .env
+cp .env.example .env.local
 npm run dev
 ```
 
-Fill in `.env` with your local keys (and optionally your Supabase project URL/keys). Open `http://localhost:3000`.
+Fill in `.env.local` (or `.env`) with your local keys and Supabase project URL/keys. Open `http://localhost:3000`.
 
 ### Scripts
 
@@ -69,10 +69,10 @@ QuizGate deploys directly to Vercel with **zero required environment variables**
 See [.env.example](.env.example).
 
 1. Run [supabase/schema.sql](supabase/schema.sql) once in your Supabase SQL Editor (safe to re-run) if using Supabase sync.
-2. Add environment variables in **Vercel → Project Settings → Environment Variables** (or in your local `.env`):
+2. Add environment variables in **Vercel → Project Settings → Environment Variables** (or in your local `.env.local` / `.env`):
    - `NEXT_PUBLIC_QUIZGATE_VAULT_KEY` — encryption key for offline `.qpack.json` and `.qres.json` files
    - `NEXT_PUBLIC_QUIZGATE_QR_KEY` — signing key for offline Student ID & Result QR codes
    - `NEXT_PUBLIC_SUPABASE_URL` — your Supabase project URL *(optional)*
-   - `NEXT_PUBLIC_SUPABASE_ANON_KEY` — your Supabase anon public key *(optional)*
-   - `SUPABASE_SERVICE_ROLE_KEY` — server-only service role key (never expose to client code or prefix with `NEXT_PUBLIC_`) *(optional)*
+   - `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (or legacy `NEXT_PUBLIC_SUPABASE_ANON_KEY`) — your Supabase public publishable key *(optional)*
+   - `SUPABASE_SERVICE_ROLE_KEY` — server-only secret/service role key used by student `/api/student/*` RPC routes (never expose to client code or prefix with `NEXT_PUBLIC_`) *(optional)*
    - `VERIFICATION_HMAC_SECRET` — optional HMAC key for server verification receipts

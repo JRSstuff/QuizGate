@@ -10,13 +10,19 @@ import {
   encryptResultPacket,
   type OfflineResultPlainPayload,
 } from "../lib/crypto/quizVault";
+import { isSupabasePublicConfigured } from "../lib/supabase/config";
 
 describe("Vercel Serverless Endpoints (Student Auth, Health, QR & File Verification)", () => {
-  it("responds with health status and un-cached server clock", async () => {
+  it("responds with health status, public Supabase env detection, and un-cached server clock", async () => {
     const hRes = await healthGet();
     expect(hRes.status).toBe(200);
-    const hData = (await hRes.json()) as { status: string; server_time: number };
+    const hData = (await hRes.json()) as {
+      status: string;
+      supabasePublicConfigured: boolean;
+      server_time: number;
+    };
     expect(hData.status).toBe("ok");
+    expect(hData.supabasePublicConfigured).toBe(isSupabasePublicConfigured());
 
     const tRes = await timeGet();
     expect(tRes.status).toBe(200);
