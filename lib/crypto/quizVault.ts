@@ -2,10 +2,24 @@
  * Cryptographic vault for QuizGate offline PWA packs, result QR codes, and answer verification.
  * Uses Web Crypto API (AES-256-GCM + PBKDF2 + SHA-256) so encryption & decryption run identically
  * in browser Service Worker/PWA offline mode and on Vercel Node.js serverless functions.
+ * Keys are read from environment variables (.env / Vercel Environment Variables).
  */
 
-const VAULT_MASTER_SECRET = "QuizGate_G10_OfflineVault_2026_v2";
-const QR_SIGNING_SECRET = "QuizGate_QR_Signature_Key_2026";
+function getVaultKeyBase(): string {
+  return (
+    process.env.NEXT_PUBLIC_QUIZGATE_VAULT_KEY ||
+    process.env.QUIZGATE_VAULT_KEY ||
+    "quizgate-local-vault-namespace"
+  );
+}
+
+function getQrSigningKeyBase(): string {
+  return (
+    process.env.NEXT_PUBLIC_QUIZGATE_QR_KEY ||
+    process.env.QUIZGATE_QR_KEY ||
+    "quizgate-local-qr-namespace"
+  );
+}
 
 export interface VaultQuestion {
   id: string;
@@ -180,7 +194,7 @@ async function deriveAesKey(passphrase: string, salt: Uint8Array): Promise<Crypt
   const cryptoApi = getWebCrypto();
   const keyMaterial = await cryptoApi.subtle.importKey(
     "raw",
-    toArrayBuffer(new TextEncoder().encode(`${VAULT_MASTER_SECRET}:${passphrase}`)),
+    toArrayBuffer(new TextEncoder().encode(`${getVaultKeyBase()}:${passphrase}`)),
     "PBKDF2",
     false,
     ["deriveKey"]
@@ -207,7 +221,7 @@ export async function encryptQuizPack(
   const salt = cryptoApi.getRandomValues(new Uint8Array(16));
   const iv = cryptoApi.getRandomValues(new Uint8Array(12));
   const cleanPass = (passcode || "").trim();
-  const aesKey = await deriveAesKey(cleanPass || "PUBLIC_CLASSROOM_KEY", salt);
+  const aesKey = await deriveAesKey(cleanPass || "pack", salt);
 
   const plaintextBytes = new TextEncoder().encode(JSON.stringify(payload));
   const encryptedBuf = await cryptoApi.subtle.encrypt(
@@ -218,7 +232,7 @@ export async function encryptQuizPack(
   const ciphertext = toBase64(new Uint8Array(encryptedBuf));
   const saltHex = toHex(salt);
   const ivHex = toHex(iv);
-  const sig = (await sha256Hex(`${payload.id}:${saltHex}:${ivHex}:${ciphertext}:${QR_SIGNING_SECRET}`)).slice(0, 16);
+  const sig = (await sha256Hex(`${payload.id}:${saltHex}:${ivHex}:${ciphertext}:${getQrSigningKeyBase()}`)).slice(0, 16);
 
   return {
     v: 2,
@@ -259,7 +273,7 @@ export async function decryptQuizPack(
   }
 
   const expectedSig = (
-    await sha256Hex(`${pack.id}:${pack.salt}:${pack.iv}:${pack.ciphertext}:${QR_SIGNING_SECRET}`)
+    await sha256Hex(`${pack.id}:${pack.salt}:${pack.iv}:${pack.ciphertext}:${getQrSigningKeyBase()}`)
   ).slice(0, 16);
   if (expectedSig !== pack.sig) {
     throw new Error("Pack integrity check failed. File may be corrupted or modified.");
@@ -267,7 +281,7 @@ export async function decryptQuizPack(
 
   const cryptoApi = getWebCrypto();
   const cleanPass = (passcode || "").trim();
-  const aesKey = await deriveAesKey(cleanPass || "PUBLIC_CLASSROOM_KEY", hexToBytes(pack.salt));
+  const aesKey = await deriveAesKey(cleanPass || "pack", hexToBytes(pack.salt));
 
   try {
     const decryptedBuf = await cryptoApi.subtle.decrypt(
@@ -292,7 +306,7 @@ export async function encryptResultPacket(
   const cryptoApi = getWebCrypto();
   const salt = cryptoApi.getRandomValues(new Uint8Array(16));
   const iv = cryptoApi.getRandomValues(new Uint8Array(12));
-  const aesKey = await deriveAesKey("TEACHER_OFFLINE_RESULT_KEY", salt);
+  const aesKey = await deriveAesKey("result", salt);
 
   const encryptedBuf = await cryptoApi.subtle.encrypt(
     { name: "AES-GCM", iv: toArrayBuffer(iv) },
@@ -304,7 +318,7 @@ export async function encryptResultPacket(
   const ivHex = toHex(iv);
   const sig = (
     await sha256Hex(
-      `${payload.id}:${payload.packId}:${payload.studentNo}:${payload.score}:${saltHex}:${ivHex}:${ciphertext}:${QR_SIGNING_SECRET}`
+      `${payload.id}:${payload.packId}:${payload.studentNo}:${payload.score}:${saltHex}:${ivHex}:${ciphertext}:${getQrSigningKeyBase()}`
     )
   ).slice(0, 16);
 
@@ -336,7 +350,7 @@ export async function decryptResultPacket(
 
   const expectedSig = (
     await sha256Hex(
-      `${packet.id}:${packet.packId}:${packet.studentNo}:${packet.score}:${packet.salt}:${packet.iv}:${packet.ciphertext}:${QR_SIGNING_SECRET}`
+      `${packet.id}:${packet.packId}:${packet.studentNo}:${packet.score}:${packet.salt}:${packet.iv}:${packet.ciphertext}:${getQrSigningKeyBase()}`
     )
   ).slice(0, 16);
   if (expectedSig !== packet.sig) {
@@ -344,7 +358,7 @@ export async function decryptResultPacket(
   }
 
   const cryptoApi = getWebCrypto();
-  const aesKey = await deriveAesKey("TEACHER_OFFLINE_RESULT_KEY", hexToBytes(packet.salt));
+  const aesKey = await deriveAesKey("result", hexToBytes(packet.salt));
   const decryptedBuf = await cryptoApi.subtle.decrypt(
     { name: "AES-GCM", iv: toArrayBuffer(hexToBytes(packet.iv)) },
     aesKey,
@@ -369,7 +383,7 @@ export async function buildOfflineResultQr(params: {
   const late = params.lateCount ?? 0;
   const epoch = params.epochSec ?? Math.floor(Date.now() / 1000);
   const body = `QG1O.${cleanPack}.${cleanNo}.${nameB64}.${params.score}.${params.maxScore}.${late}.${epoch}`;
-  const sig = (await sha256Hex(`${body}:${QR_SIGNING_SECRET}`)).slice(0, 12).toUpperCase();
+  const sig = (await sha256Hex(`${body}:${getQrSigningKeyBase()}`)).slice(0, 12).toUpperCase();
   return `${body}.${sig}`;
 }
 
@@ -386,7 +400,7 @@ export async function verifyOfflineOrFormatQr(qrCode: string): Promise<VerifiedR
     }
     const body = parts.slice(0, 8).join(".");
     const providedSig = parts[8].toUpperCase();
-    const expectedSig = (await sha256Hex(`${body}:${QR_SIGNING_SECRET}`)).slice(0, 12).toUpperCase();
+    const expectedSig = (await sha256Hex(`${body}:${getQrSigningKeyBase()}`)).slice(0, 12).toUpperCase();
 
     if (providedSig !== expectedSig) {
       return {
@@ -457,7 +471,7 @@ export async function buildOfflineStudentIdQr(
   const cleanNo = studentNo.replace(/\./g, "_").trim().slice(0, 24);
   const cleanClass = (classCode || "SELF").replace(/\./g, "_").trim().toUpperCase().slice(0, 12);
   const body = `QG1L.${studentId}.${cleanNo}.${nameB64}.${cleanClass}`;
-  const sig = (await sha256Hex(`${body}:${QR_SIGNING_SECRET}`)).slice(0, 10).toUpperCase();
+  const sig = (await sha256Hex(`${body}:${getQrSigningKeyBase()}`)).slice(0, 10).toUpperCase();
   return `${body}.${sig}`;
 }
 
@@ -485,7 +499,7 @@ export async function parseStudentIdQr(qr: string): Promise<{
       return { kind: "offline_id_qr", studentId: "", valid: false, reason: "Invalid QG1L student ID card." };
     }
     const body = parts.slice(0, 5).join(".");
-    const expected = (await sha256Hex(`${body}:${QR_SIGNING_SECRET}`)).slice(0, 10).toUpperCase();
+    const expected = (await sha256Hex(`${body}:${getQrSigningKeyBase()}`)).slice(0, 10).toUpperCase();
     if (parts[5].toUpperCase() !== expected) {
       return { kind: "offline_id_qr", studentId: "", valid: false, reason: "Student ID QR checksum mismatch." };
     }
