@@ -19,6 +19,7 @@ import {
   buildOfflineResultQr,
   decryptQuizPack,
   encryptResultPacket,
+  sha256Hex,
   syncSaltedHash,
   type OfflineResultPlainPayload,
   type StudentSubmissionAnswer,
@@ -28,6 +29,7 @@ import {
   type ActiveSession,
   type LocalAttemptRecord,
 } from "@/lib/offline/storage";
+import { flushStudentSyncQueue } from "@/lib/offline/syncEngine";
 import {
   calculateRemainingSeconds,
   formatCountdown,
@@ -195,10 +197,6 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
         setInstantFeedback(plain.instantFeedback);
         setAllowRetry(plain.allowRetry);
 
-        // Set local duration timer based on pack start
-        const endDate = new Date(Date.now() + plain.durationMinutes * 60 * 1000).toISOString();
-        setEndsAtIso(endDate);
-
         const loaded: PlayQuestion[] = plain.questions.map((q) => ({
           id: q.id,
           prompt: q.prompt,
@@ -220,6 +218,31 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
           setLoading(false);
           return;
         }
+
+        const startedIso = prev?.startedAt || new Date().toISOString();
+        const endDate = new Date(
+          Date.parse(startedIso) + plain.durationMinutes * 60 * 1000
+        ).toISOString();
+        setEndsAtIso(endDate);
+
+        if (!prev) {
+          const maxInit = loaded.reduce((acc, q) => acc + q.points, 0);
+          await offlineDb.attempts.put({
+            id: attId,
+            packOrRunId: actualId,
+            title: plain.title,
+            studentId: sess?.userId || "guest",
+            studentName: sess?.name || "Offline Student",
+            studentNo: sess?.identifier || "OFFLINE",
+            status: "in_progress",
+            score: 0,
+            maxScore: maxInit,
+            startedAt: startedIso,
+            lateCount: 0,
+            syncStatus: "offline_only",
+          });
+        }
+
         if (prev && prev.status === "in_progress" && prev.payload) {
           const restored: Record<string, StudentSubmissionAnswer> = {};
           for (const a of prev.payload.answers) {
@@ -235,6 +258,34 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
     }
   };
 
+  const flushSyncQueue = async () => {
+    if (!isRemoteRun) return;
+    const pendingBefore = await offlineDb.answerQueue
+      .where("syncStatus")
+      .equals("pending")
+      .and((x) => x.packOrRunId === actualId)
+      .count();
+    setPendingSyncCount(pendingBefore);
+
+    const result = await flushStudentSyncQueue(actualId);
+    if (result.revoked) {
+      setError("Signed in on another device. Scan your Student QR pass again to resume here.");
+      return;
+    }
+
+    const pendingAfter = await offlineDb.answerQueue
+      .where("syncStatus")
+      .equals("pending")
+      .and((x) => x.packOrRunId === actualId)
+      .count();
+    setPendingSyncCount(pendingAfter);
+
+    const updatedAtt = await offlineDb.attempts.get(attemptId);
+    if (updatedAtt && updatedAtt.syncStatus === "synced" && updatedAtt.resultQr) {
+      setFinishedRecord(updatedAtt);
+    }
+  };
+
   useEffect(() => {
     setIsOnline(navigator.onLine);
     loadQuiz();
@@ -244,12 +295,21 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
       flushSyncQueue();
     };
     const handleOffline = () => setIsOnline(false);
+    const handleFocusSync = () => {
+      if (navigator.onLine && !document.hidden) {
+        flushSyncQueue();
+      }
+    };
 
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
+    window.addEventListener("focus", handleFocusSync);
+    document.addEventListener("visibilitychange", handleFocusSync);
     return () => {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("focus", handleFocusSync);
+      document.removeEventListener("visibilitychange", handleFocusSync);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [decodedId]);
@@ -257,51 +317,46 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
   useEffect(() => {
     if (!endsAtIso || finishedRecord) return;
     const tick = () => {
-      setRemainingSecs(calculateRemainingSeconds(endsAtIso, offsetMs));
+      const secs = calculateRemainingSeconds(endsAtIso, offsetMs);
+      setRemainingSecs(secs);
     };
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
   }, [endsAtIso, offsetMs, finishedRecord]);
 
-  const flushSyncQueue = async () => {
-    if (!isRemoteRun || !session?.sessionToken || !navigator.onLine) return;
-    const pending = await offlineDb.answerQueue
-      .where("syncStatus")
-      .equals("pending")
-      .and((x) => x.packOrRunId === actualId)
-      .toArray();
-    setPendingSyncCount(pending.length);
-    if (pending.length === 0) return;
-
-    try {
-      const payload = pending.map((p) => ({
-        question_id: p.questionId,
-        selected_index: p.selectedIndex,
-        answered_at: p.answeredAt,
-      }));
-      const res = await fetch("/api/student/quiz-sync", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${session.sessionToken}`,
-        },
-        body: JSON.stringify({ runId: actualId, answers: payload }),
-      });
-      if (res.ok) {
-        for (const item of pending) {
-          if (item.id) await offlineDb.answerQueue.update(item.id, { syncStatus: "synced" });
+  // Poll remote run state every 15s to detect early teacher End Run or cross-device handover
+  useEffect(() => {
+    if (!isRemoteRun || !session?.sessionToken || finishedRecord) return;
+    const id = setInterval(async () => {
+      if (!navigator.onLine || !session.sessionToken) return;
+      try {
+        const res = await fetch("/api/student/quiz-state", {
+          headers: { Authorization: `Bearer ${session.sessionToken}` },
+        });
+        if (res.status === 401) {
+          setError("Signed in on another device. Scan your Student QR pass to resume.");
+          return;
         }
-        setPendingSyncCount(0);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.run?.ends_at) setEndsAtIso(data.run.ends_at);
+          if (data.run?.status === "ended" && !finishedRecord) {
+            await handleFinishQuiz();
+          }
+        }
+      } catch {
+        // Ignore transient offline error
       }
-    } catch {
-      // Remain queued until network stabilizes
-    }
-  };
+    }, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRemoteRun, session?.sessionToken, finishedRecord]);
 
   const handleSelectOption = async (optionIdx: number) => {
     const q = questions[currentIdx];
     if (!q || finishedRecord) return;
+    if (remainingSecs !== null && remainingSecs <= 0) return;
 
     const already = answersMap[q.id];
     if (already && !allowRetry) return;
@@ -313,7 +368,9 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
       isCorrect = q.correctIndex === optionIdx;
     } else if (q.feedbackSalt && q.correctHash) {
       isCorrect =
-        syncSaltedHash(optionIdx, `${q.id}:${q.feedbackSalt}`) === q.correctHash;
+        q.correctHash.length === 64
+          ? (await sha256Hex(`${q.id}:${optionIdx}:${q.feedbackSalt}`)) === q.correctHash
+          : syncSaltedHash(optionIdx, `${q.id}:${q.feedbackSalt}`) === q.correctHash;
     }
 
     const answerRecord: StudentSubmissionAnswer = {
@@ -593,6 +650,12 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
             </div>
           </div>
 
+          {finishedRecord.syncStatus === "pending_sync" && (
+            <div className="p-3 rounded-xl bg-[var(--warning-soft)] text-[var(--warning)] text-xs font-semibold text-left">
+              Waiting to Sync: Answers are saved offline on this phone. Reconnect online and QuizGate will automatically sync your score and issue your server QR.
+            </div>
+          )}
+
           {finishedRecord.resultQr && (
             <div className="pt-2">
               <QrCanvas
@@ -629,7 +692,8 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
 
   const picked = answersMap[currentQ.id];
   const answeredCount = Object.keys(answersMap).length;
-  const isLockedQuestion = Boolean(picked && !allowRetry);
+  const isExpired = remainingSecs !== null && remainingSecs <= 0;
+  const isLockedQuestion = Boolean((picked && !allowRetry) || isExpired);
 
   return (
     <div className="max-w-2xl mx-auto space-y-4">
@@ -735,11 +799,18 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
           })}
         </div>
 
-        {isLockedQuestion && (
-          <p className="text-xs text-[var(--ink-muted)] flex items-center gap-1.5">
-            <Lock className="w-3.5 h-3.5" />
-            <span>Answer recorded in local storage. Retries are disabled for this quiz.</span>
+        {isExpired ? (
+          <p className="text-xs text-[var(--danger)] font-semibold flex items-center gap-1.5">
+            <Clock className="w-3.5 h-3.5" />
+            <span>Time limit reached — finish and submit to generate your Result QR.</span>
           </p>
+        ) : (
+          isLockedQuestion && (
+            <p className="text-xs text-[var(--ink-muted)] flex items-center gap-1.5">
+              <Lock className="w-3.5 h-3.5" />
+              <span>Answer recorded in local storage. Retries are disabled for this quiz.</span>
+            </p>
+          )
         )}
       </div>
 

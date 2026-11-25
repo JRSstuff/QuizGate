@@ -155,9 +155,42 @@ INSERT INTO public.app_secrets (key_name, secret_value)
 VALUES ('result_hmac_key', encode(gen_random_bytes(32), 'hex'))
 ON CONFLICT (key_name) DO NOTHING;
 
--- Self-registration & class join code columns (safe re-run)
+-- Self-registration, string-based teacher accounts & class join code columns (safe re-run)
 ALTER TABLE public.classes ADD COLUMN IF NOT EXISTS join_code TEXT UNIQUE DEFAULT upper(substr(encode(gen_random_bytes(4), 'hex'), 1, 6));
 ALTER TABLE public.students ADD COLUMN IF NOT EXISTS pin_hash TEXT;
+
+-- Allow standalone username/password teachers in public.teachers without requiring auth.users emails
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE table_schema = 'public' AND table_name = 'teachers' AND constraint_name = 'teachers_id_fkey'
+  ) THEN
+    ALTER TABLE public.teachers DROP CONSTRAINT teachers_id_fkey;
+  END IF;
+END $$;
+
+ALTER TABLE public.teachers ALTER COLUMN id SET DEFAULT gen_random_uuid();
+ALTER TABLE public.teachers ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE public.teachers ADD COLUMN IF NOT EXISTS display_name TEXT;
+ALTER TABLE public.teachers ADD COLUMN IF NOT EXISTS password_hash TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_teachers_username_lower
+  ON public.teachers (lower(username))
+  WHERE username IS NOT NULL;
+
+-- 3.12 Teacher Sessions (Token-authenticated string-username teacher sessions, 24h expiry)
+CREATE TABLE IF NOT EXISTS public.teacher_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  teacher_id UUID NOT NULL REFERENCES public.teachers(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '24 hours'),
+  revoked BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE INDEX IF NOT EXISTS idx_teacher_sessions_teacher_id ON public.teacher_sessions(teacher_id);
+CREATE INDEX IF NOT EXISTS idx_teacher_sessions_token_hash ON public.teacher_sessions(token_hash);
 
 -- Schema migration adaptation if previous prototype columns exist
 DO $$
@@ -271,6 +304,7 @@ ALTER TABLE public.quiz_runs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.answers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.student_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.teacher_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.verifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.app_secrets ENABLE ROW LEVEL SECURITY;
 
@@ -429,14 +463,13 @@ LEFT JOIN (
 ) ans_stats ON ans_stats.attempt_id = a.id;
 
 -- ==============================================================================
--- 8. TEACHER FUNCTIONS (AUTHENTICATED)
+-- 8. TEACHER FUNCTIONS & INTERNAL SHARED HELPERS
 -- ==============================================================================
 
--- 8.1 create_student: returns QR payload once: QG1.<student_id>.<secret>
-CREATE OR REPLACE FUNCTION public.create_student(
-  class_id UUID,
-  name TEXT,
-  student_no TEXT
+CREATE OR REPLACE FUNCTION public._create_student_for_class(
+  p_class_id UUID,
+  p_name TEXT,
+  p_student_no TEXT
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -450,15 +483,18 @@ DECLARE
   v_clean_name TEXT;
   v_clean_student_no TEXT;
 BEGIN
-  IF NOT public.owns_class(class_id) THEN
-    RAISE EXCEPTION 'Unauthorized: Class does not belong to caller';
-  END IF;
-
-  v_clean_name := trim(name);
-  v_clean_student_no := trim(student_no);
+  v_clean_name := trim(p_name);
+  v_clean_student_no := trim(p_student_no);
 
   IF v_clean_name = '' OR v_clean_student_no = '' THEN
     RAISE EXCEPTION 'Student name and student number must not be empty';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.students s
+    WHERE s.class_id = p_class_id AND lower(s.student_no) = lower(v_clean_student_no)
+  ) THEN
+    RAISE EXCEPTION 'Student number % already exists in this class', v_clean_student_no;
   END IF;
 
   v_secret := encode(gen_random_bytes(24), 'hex');
@@ -466,19 +502,15 @@ BEGIN
   v_student_id := gen_random_uuid();
 
   INSERT INTO public.students (id, class_id, name, student_no, qr_secret_hash)
-  VALUES (v_student_id, class_id, v_clean_name, v_clean_student_no, v_secret_hash);
+  VALUES (v_student_id, p_class_id, v_clean_name, v_clean_student_no, v_secret_hash);
 
   RETURN 'QG1.' || v_student_id::text || '.' || v_secret;
-EXCEPTION
-  WHEN unique_violation THEN
-    RAISE EXCEPTION 'Student number % already exists in this class', v_clean_student_no;
 END;
 $$;
 
--- 8.2 import_students: bulk student creation, reports skipped duplicates
-CREATE OR REPLACE FUNCTION public.import_students(
-  class_id UUID,
-  rows JSONB
+CREATE OR REPLACE FUNCTION public._import_students_for_class(
+  p_class_id UUID,
+  p_rows JSONB
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -496,15 +528,11 @@ DECLARE
   v_created JSONB := '[]'::jsonb;
   v_skipped JSONB := '[]'::jsonb;
 BEGIN
-  IF NOT public.owns_class(class_id) THEN
-    RAISE EXCEPTION 'Unauthorized: Class does not belong to caller';
-  END IF;
-
-  IF jsonb_typeof(rows) <> 'array' THEN
+  IF jsonb_typeof(p_rows) <> 'array' THEN
     RAISE EXCEPTION 'Input rows must be a JSON array';
   END IF;
 
-  FOR v_item IN SELECT * FROM jsonb_array_elements(rows)
+  FOR v_item IN SELECT * FROM jsonb_array_elements(p_rows)
   LOOP
     v_name := trim(COALESCE(v_item->>'name', ''));
     v_student_no := trim(COALESCE(v_item->>'student_no', v_item->>'student_number', ''));
@@ -520,7 +548,7 @@ BEGIN
 
     IF EXISTS (
       SELECT 1 FROM public.students s
-      WHERE s.class_id = import_students.class_id AND s.student_no = v_student_no
+      WHERE s.class_id = p_class_id AND lower(s.student_no) = lower(v_student_no)
     ) THEN
       v_skipped := v_skipped || jsonb_build_object(
         'student_no', v_student_no,
@@ -535,7 +563,7 @@ BEGIN
     v_secret_hash := encode(digest(v_secret, 'sha256'), 'hex');
 
     INSERT INTO public.students (id, class_id, name, student_no, qr_secret_hash)
-    VALUES (v_student_id, import_students.class_id, v_name, v_student_no, v_secret_hash);
+    VALUES (v_student_id, p_class_id, v_name, v_student_no, v_secret_hash);
 
     v_payload := 'QG1.' || v_student_id::text || '.' || v_secret;
 
@@ -556,9 +584,8 @@ BEGIN
 END;
 $$;
 
--- 8.3 regenerate_student_qr: generates new secret and revokes existing sessions
-CREATE OR REPLACE FUNCTION public.regenerate_student_qr(
-  student_id UUID
+CREATE OR REPLACE FUNCTION public._regenerate_student_qr_internal(
+  p_student_id UUID
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -566,42 +593,26 @@ SECURITY DEFINER
 SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
-  v_class_id UUID;
   v_secret TEXT;
   v_secret_hash TEXT;
 BEGIN
-  SELECT class_id INTO v_class_id
-  FROM public.students
-  WHERE id = student_id;
-
-  IF v_class_id IS NULL THEN
-    RAISE EXCEPTION 'Student not found: %', student_id;
-  END IF;
-
-  IF NOT public.owns_class(v_class_id) THEN
-    RAISE EXCEPTION 'Unauthorized: Caller does not own student class';
-  END IF;
-
   v_secret := encode(gen_random_bytes(24), 'hex');
   v_secret_hash := encode(digest(v_secret, 'sha256'), 'hex');
 
   UPDATE public.students
   SET qr_secret_hash = v_secret_hash
-  WHERE id = student_id;
+  WHERE id = p_student_id;
 
-  -- Revoke existing active sessions
   UPDATE public.student_sessions
   SET revoked = true
-  WHERE student_sessions.student_id = regenerate_student_qr.student_id
-    AND revoked = false;
+  WHERE student_id = p_student_id AND revoked = false;
 
-  RETURN 'QG1.' || student_id::text || '.' || v_secret;
+  RETURN 'QG1.' || p_student_id::text || '.' || v_secret;
 END;
 $$;
 
--- 8.4 start_run: checks ownership, closes expired runs, sets ends_at = now() + duration
-CREATE OR REPLACE FUNCTION public.start_run(
-  quiz_id UUID
+CREATE OR REPLACE FUNCTION public._start_run_internal(
+  p_quiz_id UUID
 )
 RETURNS UUID
 LANGUAGE plpgsql
@@ -614,27 +625,16 @@ DECLARE
   v_q_count INTEGER;
   v_duration_interval INTERVAL;
 BEGIN
-  SELECT * INTO v_quiz
-  FROM public.quizzes
-  WHERE id = quiz_id;
-
+  SELECT * INTO v_quiz FROM public.quizzes WHERE id = p_quiz_id;
   IF v_quiz IS NULL THEN
-    RAISE EXCEPTION 'Quiz not found: %', quiz_id;
+    RAISE EXCEPTION 'Quiz not found: %', p_quiz_id;
   END IF;
 
-  IF NOT public.owns_quiz(quiz_id) THEN
-    RAISE EXCEPTION 'Unauthorized: Caller does not own quiz %', quiz_id;
-  END IF;
-
-  SELECT COUNT(*) INTO v_q_count
-  FROM public.questions
-  WHERE questions.quiz_id = start_run.quiz_id;
-
+  SELECT COUNT(*) INTO v_q_count FROM public.questions WHERE quiz_id = p_quiz_id;
   IF v_q_count = 0 THEN
     RAISE EXCEPTION 'Cannot start run: Quiz has no questions';
   END IF;
 
-  -- Close expired runs for this class first and submit their in-progress attempts
   UPDATE public.attempts
   SET status = 'submitted', submitted_at = COALESCE(submitted_at, now())
   WHERE run_id IN (
@@ -646,7 +646,6 @@ BEGIN
   SET status = 'ended'
   WHERE class_id = v_quiz.class_id AND status = 'running' AND ends_at <= now();
 
-  -- Verify no unexpired active run remains for this class
   IF EXISTS (
     SELECT 1 FROM public.quiz_runs
     WHERE class_id = v_quiz.class_id AND status = 'running'
@@ -657,52 +656,33 @@ BEGIN
   v_duration_interval := (v_quiz.duration_minutes || ' minutes')::interval;
 
   INSERT INTO public.quiz_runs (quiz_id, class_id, status, started_at, ends_at)
-  VALUES (quiz_id, v_quiz.class_id, 'running', now(), now() + v_duration_interval)
+  VALUES (p_quiz_id, v_quiz.class_id, 'running', now(), now() + v_duration_interval)
   RETURNING id INTO v_run_id;
 
   RETURN v_run_id;
 END;
 $$;
 
--- 8.5 end_run: ends run and submits all in-progress attempts
-CREATE OR REPLACE FUNCTION public.end_run(
-  run_id UUID
+CREATE OR REPLACE FUNCTION public._end_run_internal(
+  p_run_id UUID
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, extensions, pg_temp
 AS $$
-DECLARE
-  v_run RECORD;
 BEGIN
-  SELECT * INTO v_run
-  FROM public.quiz_runs
-  WHERE id = run_id;
-
-  IF v_run IS NULL THEN
-    RAISE EXCEPTION 'Quiz run not found: %', run_id;
-  END IF;
-
-  IF NOT public.owns_run(run_id) THEN
-    RAISE EXCEPTION 'Unauthorized: Caller does not own run %', run_id;
-  END IF;
-
-  UPDATE public.quiz_runs
-  SET status = 'ended'
-  WHERE id = run_id;
-
+  UPDATE public.quiz_runs SET status = 'ended' WHERE id = p_run_id;
   UPDATE public.attempts
   SET status = 'submitted', submitted_at = COALESCE(submitted_at, now())
-  WHERE attempts.run_id = end_run.run_id AND status = 'in_progress';
-
+  WHERE run_id = p_run_id AND status = 'in_progress';
   RETURN true;
 END;
 $$;
 
--- 8.6 verify_result: checks HMAC signature and attempt ownership, records verification row
-CREATE OR REPLACE FUNCTION public.verify_result(
-  code TEXT
+CREATE OR REPLACE FUNCTION public._verify_result_for_teacher(
+  p_teacher_id UUID,
+  p_code TEXT
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -724,7 +704,7 @@ DECLARE
   v_is_valid BOOLEAN;
   v_record RECORD;
 BEGIN
-  v_parts := string_to_array(trim(code), '.');
+  v_parts := string_to_array(trim(p_code), '.');
   IF array_length(v_parts, 1) <> 6 OR v_parts[1] <> 'QG1R' THEN
     RAISE EXCEPTION 'Invalid result QR format. Expected QG1R.<attempt_id>.<score>.<max>.<epoch>.<hmac>';
   END IF;
@@ -749,7 +729,6 @@ BEGIN
 
   v_signed_payload := 'QG1R.' || v_parts[2] || '.' || v_parts[3] || '.' || v_parts[4] || '.' || v_parts[5];
   v_expected_hmac := encode(hmac(v_signed_payload::bytea, v_hmac_key::bytea, 'sha256'), 'hex');
-
   v_sig_valid := (lower(v_code_hmac) = lower(v_expected_hmac));
 
   SELECT
@@ -758,6 +737,7 @@ BEGIN
     a.score,
     a.max_score,
     s.name AS student_name,
+    s.student_no AS student_no,
     c.teacher_id
   INTO v_record
   FROM public.attempts a
@@ -770,7 +750,7 @@ BEGIN
     RAISE EXCEPTION 'Attempt not found: %', v_attempt_id;
   END IF;
 
-  IF v_record.teacher_id <> auth.uid() THEN
+  IF v_record.teacher_id <> p_teacher_id THEN
     RAISE EXCEPTION 'Unauthorized: Quiz attempt does not belong to your classes';
   END IF;
 
@@ -789,8 +769,8 @@ BEGIN
   ) VALUES (
     v_record.run_id,
     v_record.attempt_id,
-    auth.uid(),
-    code,
+    p_teacher_id,
+    p_code,
     v_code_score,
     v_record.score,
     v_is_valid,
@@ -799,12 +779,640 @@ BEGIN
 
   RETURN jsonb_build_object(
     'student_name', v_record.student_name,
+    'student_no', v_record.student_no,
     'score_in_code', v_code_score,
+    'max_score', v_code_max,
     'score_in_db', v_record.score,
     'matches', v_scores_match,
     'signature_valid', v_sig_valid,
     'is_valid', v_is_valid
   );
+END;
+$$;
+
+-- 8.1 create_student: authenticated teacher wrapper
+CREATE OR REPLACE FUNCTION public.create_student(
+  class_id UUID,
+  name TEXT,
+  student_no TEXT
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+BEGIN
+  IF NOT public.owns_class(class_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Class does not belong to caller';
+  END IF;
+  RETURN public._create_student_for_class(class_id, name, student_no);
+END;
+$$;
+
+-- 8.2 import_students: authenticated teacher wrapper
+CREATE OR REPLACE FUNCTION public.import_students(
+  class_id UUID,
+  rows JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+BEGIN
+  IF NOT public.owns_class(class_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Class does not belong to caller';
+  END IF;
+  RETURN public._import_students_for_class(class_id, rows);
+END;
+$$;
+
+-- 8.3 regenerate_student_qr: authenticated teacher wrapper
+CREATE OR REPLACE FUNCTION public.regenerate_student_qr(
+  student_id UUID
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_class_id UUID;
+BEGIN
+  SELECT class_id INTO v_class_id FROM public.students WHERE id = student_id;
+  IF v_class_id IS NULL THEN
+    RAISE EXCEPTION 'Student not found: %', student_id;
+  END IF;
+  IF NOT public.owns_class(v_class_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Caller does not own student class';
+  END IF;
+  RETURN public._regenerate_student_qr_internal(student_id);
+END;
+$$;
+
+-- 8.4 start_run: authenticated teacher wrapper
+CREATE OR REPLACE FUNCTION public.start_run(
+  quiz_id UUID
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+BEGIN
+  IF NOT public.owns_quiz(quiz_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Caller does not own quiz %', quiz_id;
+  END IF;
+  RETURN public._start_run_internal(quiz_id);
+END;
+$$;
+
+-- 8.5 end_run: authenticated teacher wrapper
+CREATE OR REPLACE FUNCTION public.end_run(
+  run_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+BEGIN
+  IF NOT public.owns_run(run_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Caller does not own run %', run_id;
+  END IF;
+  RETURN public._end_run_internal(run_id);
+END;
+$$;
+
+-- 8.6 verify_result: authenticated teacher wrapper
+CREATE OR REPLACE FUNCTION public.verify_result(
+  code TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+BEGIN
+  RETURN public._verify_result_for_teacher(auth.uid(), code);
+END;
+$$;
+
+-- ==============================================================================
+-- 8B. STRING-ONLY TEACHER FUNCTIONS (SERVICE_ROLE ONLY, NO EMAIL REQUIRED)
+-- ==============================================================================
+
+CREATE OR REPLACE FUNCTION public._resolve_teacher_id(p_token TEXT)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_token_hash TEXT;
+  v_teacher_id UUID;
+BEGIN
+  IF COALESCE(trim(p_token), '') = '' THEN
+    RAISE EXCEPTION 'Unauthorized: Missing teacher session token';
+  END IF;
+
+  v_token_hash := encode(digest(trim(p_token), 'sha256'), 'hex');
+  SELECT teacher_id INTO v_teacher_id
+  FROM public.teacher_sessions
+  WHERE token_hash = v_token_hash
+    AND revoked = false
+    AND expires_at > now();
+
+  IF v_teacher_id IS NULL THEN
+    RAISE EXCEPTION 'Unauthorized: Invalid or expired teacher session';
+  END IF;
+
+  RETURN v_teacher_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_register_username(
+  p_username TEXT,
+  p_display_name TEXT,
+  p_password TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_clean_user TEXT := lower(trim(COALESCE(p_username, '')));
+  v_clean_name TEXT := trim(COALESCE(p_display_name, ''));
+  v_clean_pass TEXT := trim(COALESCE(p_password, ''));
+  v_teacher_id UUID;
+  v_raw_token TEXT;
+  v_token_hash TEXT;
+BEGIN
+  IF length(v_clean_user) < 2 OR v_clean_user ~ '\s' THEN
+    RAISE EXCEPTION 'Username must be at least 2 characters with no spaces';
+  END IF;
+  IF length(v_clean_pass) < 6 THEN
+    RAISE EXCEPTION 'Password must be at least 6 characters';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.teachers WHERE lower(username) = v_clean_user) THEN
+    RAISE EXCEPTION 'Username "%" is already taken. Sign in instead.', v_clean_user;
+  END IF;
+
+  v_teacher_id := gen_random_uuid();
+  IF v_clean_name = '' THEN
+    v_clean_name := v_clean_user;
+  END IF;
+
+  INSERT INTO public.teachers (id, username, display_name, password_hash, email)
+  VALUES (
+    v_teacher_id,
+    v_clean_user,
+    v_clean_name,
+    crypt(v_clean_pass, gen_salt('bf')),
+    NULL
+  );
+
+  v_raw_token := encode(gen_random_bytes(32), 'hex');
+  v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
+  INSERT INTO public.teacher_sessions (teacher_id, token_hash, expires_at, revoked)
+  VALUES (v_teacher_id, v_token_hash, now() + interval '24 hours', false);
+
+  RETURN jsonb_build_object(
+    'session_token', v_raw_token,
+    'teacher', jsonb_build_object(
+      'id', v_teacher_id,
+      'username', v_clean_user,
+      'display_name', v_clean_name
+    )
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_login_username(
+  p_username TEXT,
+  p_password TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_clean_user TEXT := lower(trim(COALESCE(p_username, '')));
+  v_clean_pass TEXT := trim(COALESCE(p_password, ''));
+  v_teacher RECORD;
+  v_raw_token TEXT;
+  v_token_hash TEXT;
+BEGIN
+  SELECT id, username, display_name, password_hash INTO v_teacher
+  FROM public.teachers
+  WHERE lower(username) = v_clean_user;
+
+  IF v_teacher IS NULL OR v_teacher.password_hash IS NULL THEN
+    RAISE EXCEPTION 'Invalid username or password';
+  END IF;
+
+  IF crypt(v_clean_pass, v_teacher.password_hash) <> v_teacher.password_hash THEN
+    RAISE EXCEPTION 'Invalid username or password';
+  END IF;
+
+  v_raw_token := encode(gen_random_bytes(32), 'hex');
+  v_token_hash := encode(digest(v_raw_token, 'sha256'), 'hex');
+  INSERT INTO public.teacher_sessions (teacher_id, token_hash, expires_at, revoked)
+  VALUES (v_teacher.id, v_token_hash, now() + interval '24 hours', false);
+
+  RETURN jsonb_build_object(
+    'session_token', v_raw_token,
+    'teacher', jsonb_build_object(
+      'id', v_teacher.id,
+      'username', v_teacher.username,
+      'display_name', COALESCE(v_teacher.display_name, v_teacher.username)
+    )
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_get_workspace(
+  p_token TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+  v_teacher RECORD;
+  v_classes JSONB := '[]'::jsonb;
+  v_quizzes JSONB := '[]'::jsonb;
+  v_active_runs JSONB := '[]'::jsonb;
+BEGIN
+  SELECT id, username, display_name INTO v_teacher
+  FROM public.teachers WHERE id = v_teacher_id;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'id', c.id,
+        'name', c.name,
+        'join_code', c.join_code,
+        'created_at', c.created_at,
+        'students', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'id', s.id,
+              'name', s.name,
+              'student_no', s.student_no,
+              'created_at', s.created_at
+            ) ORDER BY s.name ASC
+          )
+          FROM public.students s WHERE s.class_id = c.id
+        ), '[]'::jsonb)
+      ) ORDER BY c.created_at DESC
+    ),
+    '[]'::jsonb
+  ) INTO v_classes
+  FROM public.classes c
+  WHERE c.teacher_id = v_teacher_id;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'id', qz.id,
+        'title', qz.title,
+        'class_id', qz.class_id,
+        'duration_minutes', qz.duration_minutes,
+        'instant_feedback', qz.instant_feedback,
+        'allow_retry', qz.allow_retry,
+        'created_at', qz.created_at,
+        'questions', COALESCE((
+          SELECT jsonb_agg(
+            jsonb_build_object(
+              'id', qq.id,
+              'question_text', qq.question_text,
+              'options', qq.options,
+              'correct_index', qq.correct_index,
+              'points', qq.points
+            ) ORDER BY qq.sort_order ASC, qq.created_at ASC
+          )
+          FROM public.questions qq WHERE qq.quiz_id = qz.id
+        ), '[]'::jsonb)
+      ) ORDER BY qz.created_at DESC
+    ),
+    '[]'::jsonb
+  ) INTO v_quizzes
+  FROM public.quizzes qz
+  WHERE qz.teacher_id = v_teacher_id;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'id', r.id,
+        'quiz_id', r.quiz_id,
+        'class_id', r.class_id,
+        'status', r.status,
+        'started_at', r.started_at,
+        'ends_at', r.ends_at
+      ) ORDER BY r.started_at DESC
+    ),
+    '[]'::jsonb
+  ) INTO v_active_runs
+  FROM public.quiz_runs r
+  JOIN public.classes c ON r.class_id = c.id
+  WHERE c.teacher_id = v_teacher_id AND r.status = 'running';
+
+  RETURN jsonb_build_object(
+    'teacher', jsonb_build_object(
+      'id', v_teacher.id,
+      'username', v_teacher.username,
+      'display_name', COALESCE(v_teacher.display_name, v_teacher.username)
+    ),
+    'classes', v_classes,
+    'quizzes', v_quizzes,
+    'active_runs', v_active_runs
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_create_class(
+  p_token TEXT,
+  p_name TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+  v_clean TEXT := trim(COALESCE(p_name, ''));
+  v_code TEXT := upper(substr(encode(gen_random_bytes(4), 'hex'), 1, 6));
+  v_row RECORD;
+BEGIN
+  IF v_clean = '' THEN
+    RAISE EXCEPTION 'Class name is required';
+  END IF;
+
+  INSERT INTO public.classes (teacher_id, name, join_code)
+  VALUES (v_teacher_id, v_clean, v_code)
+  RETURNING * INTO v_row;
+
+  RETURN jsonb_build_object(
+    'id', v_row.id,
+    'name', v_row.name,
+    'join_code', v_row.join_code,
+    'created_at', v_row.created_at
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_add_student(
+  p_token TEXT,
+  p_class_id UUID,
+  p_name TEXT,
+  p_student_no TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+  v_payload TEXT;
+  v_stu_id TEXT;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.classes WHERE id = p_class_id AND teacher_id = v_teacher_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Class not found for your account';
+  END IF;
+  v_payload := public._create_student_for_class(p_class_id, p_name, p_student_no);
+  v_stu_id := split_part(v_payload, '.', 2);
+  RETURN jsonb_build_object(
+    'id', v_stu_id,
+    'name', trim(p_name),
+    'student_no', trim(p_student_no),
+    'qr_payload', v_payload
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_import_students(
+  p_token TEXT,
+  p_class_id UUID,
+  p_rows JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.classes WHERE id = p_class_id AND teacher_id = v_teacher_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Class not found for your account';
+  END IF;
+  RETURN public._import_students_for_class(p_class_id, p_rows);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_regenerate_student_qr(
+  p_token TEXT,
+  p_student_id UUID
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.students s
+    JOIN public.classes c ON s.class_id = c.id
+    WHERE s.id = p_student_id AND c.teacher_id = v_teacher_id
+  ) THEN
+    RAISE EXCEPTION 'Unauthorized: Student not found for your classes';
+  END IF;
+  RETURN public._regenerate_student_qr_internal(p_student_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_create_quiz(
+  p_token TEXT,
+  p_class_id UUID,
+  p_title TEXT,
+  p_description TEXT,
+  p_duration_minutes INTEGER,
+  p_instant_feedback BOOLEAN,
+  p_allow_retry BOOLEAN,
+  p_questions JSONB
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+  v_quiz_id UUID;
+  v_q JSONB;
+  v_idx INTEGER := 0;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.classes WHERE id = p_class_id AND teacher_id = v_teacher_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Class not found for your account';
+  END IF;
+  IF trim(COALESCE(p_title, '')) = '' OR jsonb_typeof(p_questions) <> 'array' OR jsonb_array_length(p_questions) = 0 THEN
+    RAISE EXCEPTION 'Quiz title and at least one question are required';
+  END IF;
+
+  INSERT INTO public.quizzes (
+    teacher_id, class_id, title, description, duration_minutes, instant_feedback, allow_retry
+  ) VALUES (
+    v_teacher_id,
+    p_class_id,
+    trim(p_title),
+    COALESCE(p_description, ''),
+    GREATEST(1, COALESCE(p_duration_minutes, 15)),
+    COALESCE(p_instant_feedback, true),
+    COALESCE(p_allow_retry, false)
+  )
+  RETURNING id INTO v_quiz_id;
+
+  FOR v_q IN SELECT * FROM jsonb_array_elements(p_questions)
+  LOOP
+    INSERT INTO public.questions (
+      quiz_id, question_text, options, correct_index, points, sort_order
+    ) VALUES (
+      v_quiz_id,
+      COALESCE(v_q->>'prompt', v_q->>'question_text', ''),
+      COALESCE(v_q->'options', '[]'::jsonb),
+      COALESCE((v_q->>'correctIndex')::integer, (v_q->>'correct_index')::integer, 0),
+      GREATEST(1, COALESCE((v_q->>'points')::integer, 1)),
+      v_idx
+    );
+    v_idx := v_idx + 1;
+  END LOOP;
+
+  RETURN jsonb_build_object('quiz_id', v_quiz_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_start_run(
+  p_token TEXT,
+  p_quiz_id UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+  v_run_id UUID;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.quizzes WHERE id = p_quiz_id AND teacher_id = v_teacher_id) THEN
+    RAISE EXCEPTION 'Unauthorized: Quiz not found for your account';
+  END IF;
+  v_run_id := public._start_run_internal(p_quiz_id);
+  RETURN jsonb_build_object('run_id', v_run_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_end_run(
+  p_token TEXT,
+  p_run_id UUID
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.quiz_runs r
+    JOIN public.classes c ON r.class_id = c.id
+    WHERE r.id = p_run_id AND c.teacher_id = v_teacher_id
+  ) THEN
+    RAISE EXCEPTION 'Unauthorized: Run not found for your classes';
+  END IF;
+  RETURN public._end_run_internal(p_run_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_get_run_results(
+  p_token TEXT,
+  p_run_id UUID
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+  v_rows JSONB := '[]'::jsonb;
+  v_run RECORD;
+BEGIN
+  SELECT r.* INTO v_run
+  FROM public.quiz_runs r
+  JOIN public.classes c ON r.class_id = c.id
+  WHERE r.id = p_run_id AND c.teacher_id = v_teacher_id;
+
+  IF v_run IS NULL THEN
+    RAISE EXCEPTION 'Unauthorized: Run not found for your classes';
+  END IF;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'run_id', rr.run_id,
+        'student_id', rr.student_id,
+        'student_name', rr.student_name,
+        'student_no', rr.student_no,
+        'status', rr.status,
+        'answered_count', rr.answered_count,
+        'score', rr.score,
+        'max_score', rr.max_score,
+        'late_answers', rr.late_answers,
+        'is_verified', rr.is_verified
+      ) ORDER BY rr.student_name ASC
+    ),
+    '[]'::jsonb
+  ) INTO v_rows
+  FROM public.run_results rr
+  WHERE rr.run_id = p_run_id;
+
+  RETURN jsonb_build_object(
+    'run', jsonb_build_object(
+      'id', v_run.id,
+      'quiz_id', v_run.quiz_id,
+      'status', v_run.status,
+      'started_at', v_run.started_at,
+      'ends_at', v_run.ends_at
+    ),
+    'results', v_rows
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.teacher_verify_result(
+  p_token TEXT,
+  p_code TEXT
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+  v_teacher_id UUID := public._resolve_teacher_id(p_token);
+BEGIN
+  RETURN public._verify_result_for_teacher(v_teacher_id, p_code);
 END;
 $$;
 
@@ -1562,7 +2170,20 @@ GRANT EXECUTE ON FUNCTION public.start_run(UUID) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.end_run(UUID) TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.verify_result(TEXT) TO authenticated, service_role;
 
--- Student functions: EXECUTE granted to service_role ONLY
+-- String-only teacher & student RPCs: EXECUTE granted to service_role ONLY
+GRANT EXECUTE ON FUNCTION public.teacher_register_username(TEXT, TEXT, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_login_username(TEXT, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_get_workspace(TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_create_class(TEXT, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_add_student(TEXT, UUID, TEXT, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_import_students(TEXT, UUID, JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_regenerate_student_qr(TEXT, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_create_quiz(TEXT, UUID, TEXT, TEXT, INTEGER, BOOLEAN, BOOLEAN, JSONB) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_start_run(TEXT, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_end_run(TEXT, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_get_run_results(TEXT, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.teacher_verify_result(TEXT, TEXT) TO service_role;
+
 GRANT EXECUTE ON FUNCTION public.student_sign_in(TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.student_get_state(TEXT) TO service_role;
 GRANT EXECUTE ON FUNCTION public.student_submit_answers(TEXT, UUID, JSONB) TO service_role;

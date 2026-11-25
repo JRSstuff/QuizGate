@@ -36,6 +36,7 @@ import {
   type LocalAttemptRecord,
   type StudyProgressRecord,
 } from "@/lib/offline/storage";
+import { flushStudentSyncQueue } from "@/lib/offline/syncEngine";
 import { Grade10ModuleDrawer } from "./Grade10ModuleDrawer";
 import { QrCanvas } from "./QrCanvas";
 
@@ -165,12 +166,29 @@ export function StudentWorkspace() {
     setSyncing(true);
     setRemoteError(null);
     try {
+      const flushRes = await flushStudentSyncQueue();
+      if (flushRes.revoked) {
+        setRemoteError("Signed in on another device. Scan your Student QR pass to resume here.");
+        setRemoteState(null);
+        return;
+      }
+
+      if (flushRes.finalizedAttempts > 0 || flushRes.syncedQuestions > 0) {
+        const refreshedAttempts = await offlineDb.attempts.toArray();
+        refreshedAttempts.sort((a, b) => (b.startedAt > a.startedAt ? 1 : -1));
+        setAttempts(refreshedAttempts);
+      }
+
       const res = await fetch("/api/student/quiz-state", {
         headers: { Authorization: `Bearer ${token}` },
       });
       const json = await res.json();
       if (!res.ok) {
-        setRemoteError(json.error || "Session expired or signed in on another device.");
+        setRemoteError(
+          res.status === 401
+            ? "Signed in on another device or session expired. Scan your Student QR pass to resume."
+            : json.error || "Could not load live quiz state."
+        );
         setRemoteState(null);
       } else if (json.mode === "supabase") {
         setRemoteState({
@@ -189,10 +207,38 @@ export function StudentWorkspace() {
   useEffect(() => {
     loadLocalWorkspace();
     const onSessChange = () => loadLocalWorkspace();
+    const onReconnect = () => {
+      if (navigator.onLine && !document.hidden) {
+        offlineDb?.session.get("active").then((sess) => {
+          if (sess?.role === "student" && sess.authMode === "supabase" && sess.sessionToken) {
+            refreshRemoteState(sess.sessionToken);
+          }
+        });
+      }
+    };
     window.addEventListener("qg:session-updated", onSessChange);
-    return () => window.removeEventListener("qg:session-updated", onSessChange);
+    window.addEventListener("online", onReconnect);
+    window.addEventListener("focus", onReconnect);
+    document.addEventListener("visibilitychange", onReconnect);
+    return () => {
+      window.removeEventListener("qg:session-updated", onSessChange);
+      window.removeEventListener("online", onReconnect);
+      window.removeEventListener("focus", onReconnect);
+      document.removeEventListener("visibilitychange", onReconnect);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Poll live quiz start automatically while waiting in cloud student mode
+  useEffect(() => {
+    if (!session || session.authMode !== "supabase" || !session.sessionToken) return;
+    const token = session.sessionToken;
+    const id = setInterval(() => {
+      if (navigator.onLine) refreshRemoteState(token);
+    }, 10000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.authMode, session?.sessionToken]);
 
   const handleSaveStudyProgress = async (next: StudyProgressRecord) => {
     setStudyProgress(next);

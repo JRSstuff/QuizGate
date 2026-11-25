@@ -5,13 +5,16 @@ import {
   type EncryptedResultPacket,
 } from "@/lib/crypto/quizVault";
 import { checkRateLimit } from "@/lib/security/ratelimit";
-import { getSupabaseTeacherClient } from "@/lib/supabase/server";
+import {
+  getSupabaseServiceClient,
+  getSupabaseTeacherClient,
+} from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   const ip = req.headers.get("x-forwarded-for") || "local";
-  const rl = checkRateLimit(`verify_result:${ip}`, 60, 60000);
+  const rl = checkRateLimit(`verify_result:${ip}`, 200, 60000);
   if (!rl.allowed) {
     return NextResponse.json(
       { valid: false, reason: "Rate limit exceeded. Wait a minute." },
@@ -45,12 +48,61 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Case 2: Supabase QG1R.* QR code verified via teacher JWT
+    // Case 2: Supabase QG1R.* QR code verified via string teacher session token OR legacy teacher JWT
     if (code.startsWith("QG1R.")) {
       const authHeader = req.headers.get("authorization") || "";
       const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-      const supabase = token ? getSupabaseTeacherClient(token) : null;
 
+      if (!token || token.startsWith("offline_")) {
+        return NextResponse.json(
+          {
+            valid: false,
+            format: "supabase_qr",
+            reason:
+              "Sign in as a connected Supabase teacher while online to verify database-signed QG1R codes.",
+          },
+          { status: 401 }
+        );
+      }
+
+      const isLegacyJwt = token.includes(".");
+      if (!isLegacyJwt) {
+        const service = getSupabaseServiceClient();
+        if (!service) {
+          return NextResponse.json(
+            {
+              valid: false,
+              format: "supabase_qr",
+              reason: "Server Supabase service key missing for QG1R verification.",
+            },
+            { status: 503 }
+          );
+        }
+        const { data, error } = await service.rpc("teacher_verify_result", {
+          p_token: token,
+          p_code: code,
+        });
+        if (error) {
+          return NextResponse.json(
+            { valid: false, format: "supabase_qr", reason: error.message },
+            { status: 400 }
+          );
+        }
+        return NextResponse.json({
+          valid: Boolean(data.is_valid),
+          format: "supabase_qr",
+          verifiedVia: "supabase",
+          studentName: data.student_name,
+          studentNo: data.student_no,
+          score: data.score_in_code,
+          maxScore: data.max_score,
+          scoreInDb: data.score_in_db,
+          matchesDb: data.matches,
+          signatureValid: data.signature_valid,
+        });
+      }
+
+      const supabase = getSupabaseTeacherClient(token);
       if (!supabase) {
         return NextResponse.json(
           {

@@ -83,6 +83,18 @@ The secret key `SUPABASE_SERVICE_ROLE_KEY` must remain on the application server
 | `student_get_result(token TEXT, run_id UUID)` | `service_role` only | `token TEXT`, `run_id UUID` | `JSONB` (`{result_code, attempt_id, score, max_score, status, submitted_at}`) | - Token invalid, expired, or revoked<br>- Attempt does not exist for run |
 | `student_register_with_code(p_join_code TEXT, p_name TEXT, p_student_no TEXT, p_pin TEXT)` | `service_role` only | `p_join_code`, `p_name`, `p_student_no`, `p_pin` | `JSONB` (`{session_token, qr_payload, student}`) | - Invalid class join code<br>- Empty fields or PIN under 4 characters<br>- Duplicate student number |
 | `student_sign_in_with_pin(p_join_code TEXT, p_student_no TEXT, p_pin TEXT)` | `service_role` only | `p_join_code`, `p_student_no`, `p_pin` | `JSONB` (`{session_token, student}`) | - Invalid class join code<br>- Incorrect PIN or QR-only student |
+| `teacher_register_username(p_username, p_display_name, p_password)` | `service_role` only | String username, display name, password | `JSONB` (`{session_token, teacher}`) | - Username < 2 chars or has spaces<br>- Password < 6 chars<br>- Duplicate username |
+| `teacher_login_username(p_username, p_password)` | `service_role` only | String username, password | `JSONB` (`{session_token, teacher}`) | - Invalid username or password |
+| `teacher_get_workspace(p_token)` | `service_role` only | Teacher session token | `JSONB` (`{teacher, classes, quizzes, active_runs}`) | - Token invalid or expired |
+| `teacher_create_class(p_token, p_name)` | `service_role` only | Session token, class name | `JSONB` (`{id, name, join_code}`) | - Token invalid or empty name |
+| `teacher_add_student(p_token, p_class_id, p_name, p_student_no)` | `service_role` only | Session token, class UUID, name, number | `JSONB` (`{id, name, student_no, qr_payload}`) | - Unauthorized class or duplicate student number |
+| `teacher_import_students(p_token, p_class_id, p_rows)` | `service_role` only | Session token, class UUID, JSON rows | `JSONB` (`{created, skipped, created_count, skipped_count}`) | - Unauthorized class or invalid rows |
+| `teacher_regenerate_student_qr(p_token, p_student_id)` | `service_role` only | Session token, student UUID | `TEXT` (`QG1.<id>.<secret>`) | - Unauthorized student |
+| `teacher_create_quiz(...)` | `service_role` only | Session token, class UUID, quiz config & JSON questions | `JSONB` (`{quiz_id}`) | - Unauthorized class or zero questions |
+| `teacher_start_run(p_token, p_quiz_id)` | `service_role` only | Session token, quiz UUID | `JSONB` (`{run_id}`) | - Unauthorized quiz or active run already running |
+| `teacher_end_run(p_token, p_run_id)` | `service_role` only | Session token, run UUID | `BOOLEAN` | - Unauthorized run |
+| `teacher_get_run_results(p_token, p_run_id)` | `service_role` only | Session token, run UUID | `JSONB` (`{run, results}`) | - Unauthorized run |
+| `teacher_verify_result(p_token, p_code)` | `service_role` only | Session token, `QG1R.*` result QR | `JSONB` (`{student_name, score_in_code, score_in_db, matches, signature_valid, is_valid}`) | - Unauthorized attempt or tampered signature |
 | `run_results` (View) | `authenticated`, `service_role` | Query filter `WHERE run_id = ...` | Row set (`run_id, quiz_id, class_id, student_id, student_name, student_no, status, answered_count, score, max_score, late_answers, is_verified, attempt_id, started_at, submitted_at`) | None. Evaluated under the caller's permissions (`security_invoker = true`). |
 
 ---

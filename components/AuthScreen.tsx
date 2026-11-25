@@ -17,7 +17,6 @@ import {
   sha256Hex,
 } from "@/lib/crypto/quizVault";
 import { offlineDb } from "@/lib/offline/storage";
-import { getSupabaseBrowserClient } from "@/lib/supabase/config";
 import { QrCanvas } from "./QrCanvas";
 
 type RoleMode = "student" | "teacher";
@@ -43,9 +42,9 @@ function AuthScreenInner() {
   const [studentPin, setStudentPin] = useState("");
   const [qrInput, setQrInput] = useState("");
 
-  // Teacher form state
+  // Teacher form state (string username + password, zero email required)
   const [teacherName, setTeacherName] = useState("");
-  const [teacherEmail, setTeacherEmail] = useState("");
+  const [teacherUsername, setTeacherUsername] = useState("");
   const [teacherPass, setTeacherPass] = useState("");
 
   // Scanner & UI state
@@ -360,78 +359,67 @@ function AuthScreenInner() {
   const handleTeacherAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
-    const cleanEmail = teacherEmail.trim().toLowerCase();
+    const cleanUser = teacherUsername.trim().toLowerCase();
     const cleanPass = teacherPass.trim();
-    if (!cleanEmail || cleanPass.length < 6) {
-      setError("Enter an email/username and a password of at least 6 characters.");
+    if (cleanUser.length < 2 || /\s/.test(cleanUser) || cleanPass.length < 6) {
+      setError("Enter a username (at least 2 characters, no spaces) and a 6+ character password.");
       return;
     }
 
     setLoading(true);
     try {
-      const supabase = getSupabaseBrowserClient();
+      if (navigator.onLine) {
+        const res = await fetch("/api/teacher/auth", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: tab === "register" ? "register" : "login",
+            username: cleanUser,
+            displayName: teacherName.trim() || cleanUser,
+            password: cleanPass,
+          }),
+        });
+        const data = await res.json();
 
-      if (supabase && navigator.onLine && cleanEmail.includes("@")) {
-        if (tab === "register") {
-          const { data, error: signUpErr } = await supabase.auth.signUp({
-            email: cleanEmail,
-            password: cleanPass,
-            options: { data: { name: teacherName.trim() || cleanEmail.split("@")[0] } },
-          });
-          if (signUpErr) throw signUpErr;
-          if (!data.user || !data.session) {
-            throw new Error(
-              "Teacher account created! Check your email inbox to confirm your address before signing in (or disable 'Confirm email' in Supabase Auth -> Providers -> Email)."
-            );
-          }
+        if (res.ok && data.mode === "supabase") {
           await offlineDb.session.put({
             key: "active",
             role: "teacher",
-            userId: data.user.id,
-            name: teacherName.trim() || cleanEmail,
-            identifier: cleanEmail,
+            userId: data.teacher.id,
+            name: data.teacher.display_name || cleanUser,
+            identifier: data.teacher.username || cleanUser,
             authMode: "supabase",
-            sessionToken: data.session?.access_token,
+            sessionToken: data.session_token,
           });
-        } else {
-          const { data, error: signInErr } = await supabase.auth.signInWithPassword({
-            email: cleanEmail,
-            password: cleanPass,
-          });
-          if (signInErr) throw signInErr;
-          await offlineDb.session.put({
-            key: "active",
-            role: "teacher",
-            userId: data.user.id,
-            name: (data.user.user_metadata?.name as string) || cleanEmail,
-            identifier: cleanEmail,
-            authMode: "supabase",
-            sessionToken: data.session?.access_token,
-          });
+          window.dispatchEvent(new CustomEvent("qg:session-updated"));
+          router.push("/teacher");
+          return;
         }
-        window.dispatchEvent(new CustomEvent("qg:session-updated"));
-        router.push("/teacher");
-        return;
+
+        // Reject actual invalid credentials/duplicate username rather than silently masking with offline mode
+        if (res.status !== 503) {
+          throw new Error(data.error || "Teacher authentication failed.");
+        }
       }
 
-      // Offline / Local Teacher Classroom Account
-      const pinHash = await sha256Hex(`teacher:${cleanEmail}:${cleanPass}`);
+      // Offline / Local Device Teacher Classroom Account (string username + password)
+      const pinHash = await sha256Hex(`teacher:${cleanUser}:${cleanPass}`);
       if (tab === "register") {
         const existing = await offlineDb.accounts
           .where("identifier")
-          .equals(cleanEmail)
+          .equals(cleanUser)
           .and((a) => a.role === "teacher")
           .first();
         if (existing) {
-          throw new Error("A teacher account with this identifier already exists on this device.");
+          throw new Error("A teacher account with this username already exists on this device.");
         }
         const tid = crypto.randomUUID();
-        const display = teacherName.trim() || cleanEmail;
+        const display = teacherName.trim() || cleanUser;
         await offlineDb.accounts.put({
           id: tid,
           role: "teacher",
           name: display,
-          identifier: cleanEmail,
+          identifier: cleanUser,
           pinHash,
           createdAt: new Date().toISOString(),
         });
@@ -440,18 +428,18 @@ function AuthScreenInner() {
           role: "teacher",
           userId: tid,
           name: display,
-          identifier: cleanEmail,
+          identifier: cleanUser,
           authMode: "offline",
           sessionToken: `offline_teacher_${tid}`,
         });
       } else {
         const existing = await offlineDb.accounts
           .where("identifier")
-          .equals(cleanEmail)
+          .equals(cleanUser)
           .and((a) => a.role === "teacher")
           .first();
         if (!existing || existing.pinHash !== pinHash) {
-          throw new Error("Invalid teacher credentials on this device.");
+          throw new Error("Invalid teacher username or password on this device.");
         }
         await offlineDb.session.put({
           key: "active",
@@ -781,13 +769,15 @@ function AuthScreenInner() {
             )}
             <div>
               <label className="block text-xs font-semibold text-[var(--ink-muted)] mb-1">
-                Email (for Supabase Sync) or Username (Offline Mode)
+                Username
               </label>
               <input
                 className="qg-input"
-                placeholder="teacher@school.edu or teacher1"
-                value={teacherEmail}
-                onChange={(e) => setTeacherEmail(e.target.value)}
+                autoComplete="username"
+                placeholder="e.g. teacher_dioso or ms_rivera"
+                value={teacherUsername}
+                onChange={(e) => setTeacherUsername(e.target.value)}
+                minLength={2}
                 required
               />
             </div>

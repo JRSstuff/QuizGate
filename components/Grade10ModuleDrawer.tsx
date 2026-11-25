@@ -87,6 +87,7 @@ export function Grade10ModuleDrawer({
 
   // Scenario MCQ state
   const [mcqIdx, setMcqIdx] = useState(0);
+  const [mcqSelectedOpt, setMcqSelectedOpt] = useState<(number | null)[]>([null, null]);
   const [mcqMsg, setMcqMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [mcqDone, setMcqDone] = useState<boolean[]>([false, false]);
 
@@ -105,6 +106,7 @@ export function Grade10ModuleDrawer({
     setPracticeTries([0, 0]);
     setPracticeMsg([null, null]);
     setMcqIdx(0);
+    setMcqSelectedOpt([null, null]);
     setMcqMsg(null);
     setMcqDone([false, false]);
     setReflectionText(progress.reflections[module.id] || "");
@@ -179,9 +181,12 @@ export function Grade10ModuleDrawer({
 
   const handlePickMcq = async (optIdx: number) => {
     if (!currentMcq) return;
+    const nextSel = mcqSelectedOpt.slice();
+    nextSel[mcqIdx] = optIdx;
+    setMcqSelectedOpt(nextSel);
+
     const isCorrect =
-      syncSaltedHash(optIdx, `${currentMcq.id}:${currentMcq.salt}`) ===
-      currentMcq.correctHash;
+      syncSaltedHash(optIdx, currentMcq.salt) === currentMcq.correctHash;
 
     if (isCorrect) {
       await awardStep(`${prefix}-q${mcqIdx}`, 10);
@@ -552,16 +557,26 @@ export function Grade10ModuleDrawer({
             </p>
 
             <div className="space-y-2">
-              {currentMcq.options.map((opt, idx) => (
-                <button
-                  key={idx}
-                  type="button"
-                  onClick={() => handlePickMcq(idx)}
-                  className="w-full min-h-[50px] text-left px-4 py-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] hover:border-[var(--primary)] text-sm font-medium transition-colors"
-                >
-                  <MathText text={opt} />
-                </button>
-              ))}
+              {currentMcq.options.map((opt, idx) => {
+                const chosen = mcqSelectedOpt[mcqIdx] === idx;
+                const solved = mcqDone[mcqIdx];
+                return (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => handlePickMcq(idx)}
+                    className={`w-full min-h-[50px] text-left px-4 py-3 rounded-xl border text-sm font-medium transition-colors ${
+                      chosen && solved
+                        ? "bg-[var(--success-soft)] border-emerald-500 text-[var(--success)]"
+                        : chosen
+                          ? "bg-[var(--danger-soft)] border-[var(--danger)]"
+                          : "border-[var(--border)] bg-[var(--surface)] hover:border-[var(--primary)]"
+                    }`}
+                  >
+                    <MathText text={opt} />
+                  </button>
+                );
+              })}
             </div>
 
             {mcqMsg && (

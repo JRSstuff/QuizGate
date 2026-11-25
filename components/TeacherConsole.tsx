@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   Copy,
@@ -12,7 +12,9 @@ import {
   Plus,
   Printer,
   QrCode,
+  RefreshCw,
   ScanLine,
+  Sparkles,
   Square,
   Users,
 } from "lucide-react";
@@ -28,7 +30,6 @@ import {
   type LocalTeacherClass,
   type LocalTeacherQuiz,
 } from "@/lib/offline/storage";
-import { getSupabaseBrowserClient } from "@/lib/supabase/config";
 import { QrCanvas } from "./QrCanvas";
 
 type TeacherTab = "classes" | "quizzes" | "print";
@@ -44,6 +45,14 @@ interface RunResultRow {
   late_answers: number;
   is_verified: boolean;
 }
+
+const DEMO_STUDENTS = [
+  { name: "Dela Cruz, Juan", studentNo: "2026-0101" },
+  { name: "Santos, Maria Clara", studentNo: "2026-0102" },
+  { name: "Luna, Antonio M.", studentNo: "2026-0103" },
+  { name: "Reyes, Ana Gabriela", studentNo: "2026-0104" },
+  { name: "Mendoza, Jose Miguel", studentNo: "2026-0105" },
+];
 
 export function TeacherConsole() {
   const [tab, setTab] = useState<TeacherTab>("classes");
@@ -76,57 +85,63 @@ export function TeacherConsole() {
   // Supabase Live Roster state
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [runResults, setRunResults] = useState<RunResultRow[]>([]);
+  const [refreshingRoster, setRefreshingRoster] = useState(false);
+
+  // Remember newly generated/regenerated cloud student QR payloads in memory for printing
+  const qrPayloadMemoryRef = useRef<Record<string, string>>({});
+
+  const flashMsg = (ok: boolean, text: string) => {
+    setStatusMsg({ ok, text });
+    setTimeout(() => setStatusMsg(null), 5000);
+  };
+
+  const fetchRunResults = async (token: string, runId: string) => {
+    setRefreshingRoster(true);
+    try {
+      const res = await fetch(
+        `/api/teacher/workspace?runResults=${encodeURIComponent(runId)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setRunResults((data.results || []) as RunResultRow[]);
+        if (data.run?.status === "ended") {
+          setActiveRunId(null);
+        }
+      }
+    } catch {
+      // Keep last known roster when transiently offline
+    } finally {
+      setRefreshingRoster(false);
+    }
+  };
 
   const loadWorkspace = async () => {
     if (!offlineDb) return;
     const sess = (await offlineDb.session.get("active")) || null;
-    setSession(sess?.role === "teacher" ? sess : null);
+    const activeTeacher = sess?.role === "teacher" ? sess : null;
+    setSession(activeTeacher);
 
-    // Try loading Supabase classes & quizzes if signed in via Supabase
-    const supabase = getSupabaseBrowserClient();
-    if (sess?.role === "teacher" && sess.authMode === "supabase" && supabase && navigator.onLine) {
+    if (
+      activeTeacher?.authMode === "supabase" &&
+      activeTeacher.sessionToken &&
+      !activeTeacher.sessionToken.startsWith("offline_") &&
+      navigator.onLine
+    ) {
       try {
-        const { data: clsRows } = await supabase
-          .from("classes")
-          .select("id, name, join_code, created_at, students(id, name, student_no, created_at)")
-          .order("created_at", { ascending: false });
-
-        if (clsRows) {
-          const mapped: LocalTeacherClass[] = clsRows.map(
-            (c: {
+        const res = await fetch("/api/teacher/workspace", {
+          headers: { Authorization: `Bearer ${activeTeacher.sessionToken}` },
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            classes: {
               id: string;
               name: string;
               join_code?: string;
               created_at: string;
               students?: { id: string; name: string; student_no: string; created_at: string }[];
-            }) => ({
-              id: c.id,
-              name: c.name,
-              joinCode: c.join_code || c.id.slice(0, 6).toUpperCase(),
-              createdAt: c.created_at,
-              students: (c.students || []).map((s) => ({
-                id: s.id,
-                name: s.name,
-                studentNo: s.student_no,
-                qrPayload: `Student registered in cloud (${s.student_no}) — regenerate QR to print`,
-                createdAt: s.created_at,
-              })),
-            })
-          );
-          setClasses(mapped);
-          if (!selectedClassId && mapped.length > 0) setSelectedClassId(mapped[0].id);
-        }
-
-        const { data: qzRows } = await supabase
-          .from("quizzes")
-          .select(
-            "id, title, class_id, duration_minutes, instant_feedback, allow_retry, created_at, questions(id, question_text, options, correct_index, points)"
-          )
-          .order("created_at", { ascending: false });
-
-        if (qzRows) {
-          const mappedQz: LocalTeacherQuiz[] = qzRows.map(
-            (q: {
+            }[];
+            quizzes: {
               id: string;
               title: string;
               class_id: string;
@@ -141,29 +156,58 @@ export function TeacherConsole() {
                 correct_index: number;
                 points: number;
               }[];
-            }) => ({
-              id: q.id,
-              title: q.title,
-              classId: q.class_id,
-              durationMinutes: q.duration_minutes,
-              instantFeedback: q.instant_feedback,
-              allowRetry: q.allow_retry,
-              status: "ready",
-              createdAt: q.created_at,
-              questions: (q.questions || []).map((qq) => ({
-                id: qq.id,
-                prompt: qq.question_text,
-                options: Array.isArray(qq.options)
-                  ? qq.options.map((o) => (typeof o === "string" ? o : o.text || ""))
-                  : [],
-                correctIndex: qq.correct_index,
-                points: qq.points || 1,
-              })),
-            })
-          );
-          setQuizzes(mappedQz);
+            }[];
+            active_runs?: { id: string }[];
+          };
+
+          const mappedClasses: LocalTeacherClass[] = (data.classes || []).map((c) => ({
+            id: c.id,
+            name: c.name,
+            joinCode: c.join_code || c.id.slice(0, 6).toUpperCase(),
+            createdAt: c.created_at,
+            students: (c.students || []).map((s) => ({
+              id: s.id,
+              name: s.name,
+              studentNo: s.student_no,
+              qrPayload:
+                qrPayloadMemoryRef.current[s.id] ||
+                `Cloud Student (${s.student_no}) — tap Regenerate QR to print`,
+              createdAt: s.created_at,
+            })),
+          }));
+          setClasses(mappedClasses);
+          if (!selectedClassId && mappedClasses.length > 0) {
+            setSelectedClassId(mappedClasses[0].id);
+          }
+
+          const mappedQuizzes: LocalTeacherQuiz[] = (data.quizzes || []).map((q) => ({
+            id: q.id,
+            title: q.title,
+            classId: q.class_id,
+            durationMinutes: q.duration_minutes,
+            instantFeedback: q.instant_feedback,
+            allowRetry: q.allow_retry,
+            status: "ready",
+            createdAt: q.created_at,
+            questions: (q.questions || []).map((qq) => ({
+              id: qq.id,
+              prompt: qq.question_text,
+              options: Array.isArray(qq.options)
+                ? qq.options.map((o) => (typeof o === "string" ? o : o.text || ""))
+                : [],
+              correctIndex: qq.correct_index,
+              points: qq.points || 1,
+            })),
+          }));
+          setQuizzes(mappedQuizzes);
+
+          const latestActive = data.active_runs?.[0]?.id || null;
+          if (latestActive) {
+            setActiveRunId(latestActive);
+            fetchRunResults(activeTeacher.sessionToken, latestActive);
+          }
+          return;
         }
-        return;
       } catch {
         // Fallback cleanly to local classroom storage
       }
@@ -185,10 +229,39 @@ export function TeacherConsole() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const flashMsg = (ok: boolean, text: string) => {
-    setStatusMsg({ ok, text });
-    setTimeout(() => setStatusMsg(null), 5000);
+  // Poll live classroom roster every 5 seconds while a cloud run is active
+  useEffect(() => {
+    if (!activeRunId || !session?.sessionToken || session.authMode !== "supabase") return;
+    const token = session.sessionToken;
+    const id = setInterval(() => {
+      if (navigator.onLine) fetchRunResults(token, activeRunId);
+    }, 5000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRunId, session?.sessionToken, session?.authMode]);
+
+  const callCloudAction = async (payload: Record<string, unknown>) => {
+    if (!session?.sessionToken) throw new Error("Teacher session missing.");
+    const res = await fetch("/api/teacher/workspace", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session.sessionToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || "Cloud workspace request failed.");
+    return json;
   };
+
+  const isCloudSession = Boolean(
+    session?.authMode === "supabase" &&
+      session.sessionToken &&
+      !session.sessionToken.startsWith("offline_") &&
+      typeof navigator !== "undefined" &&
+      navigator.onLine
+  );
 
   const copyText = async (key: string, text: string) => {
     try {
@@ -205,25 +278,20 @@ export function TeacherConsole() {
     const clean = newClassName.trim();
     if (!clean) return;
 
-    const supabase = getSupabaseBrowserClient();
-    const joinCode = Math.random().toString(36).slice(2, 8).toUpperCase();
-
-    if (session?.authMode === "supabase" && supabase && navigator.onLine) {
-      const { data, error } = await supabase
-        .from("classes")
-        .insert({ teacher_id: session.userId, name: clean, join_code: joinCode })
-        .select()
-        .single();
-      if (error) {
-        flashMsg(false, error.message);
-        return;
+    if (isCloudSession) {
+      try {
+        const data = await callCloudAction({ action: "create_class", name: clean });
+        setNewClassName("");
+        setSelectedClassId(data.id);
+        flashMsg(true, `Created cloud class "${data.name}" (Code: ${data.join_code}).`);
+        await loadWorkspace();
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Could not create class.");
       }
-      setNewClassName("");
-      flashMsg(true, `Created cloud class "${data.name}" (Code: ${data.join_code}).`);
-      loadWorkspace();
       return;
     }
 
+    const joinCode = Math.random().toString(36).slice(2, 8).toUpperCase();
     const newCls: LocalTeacherClass = {
       id: crypto.randomUUID(),
       name: clean,
@@ -244,41 +312,27 @@ export function TeacherConsole() {
     const cls = classes.find((c) => c.id === selectedClassId);
     if (!cls) return;
 
-    const supabase = getSupabaseBrowserClient();
-    if (session?.authMode === "supabase" && supabase && navigator.onLine) {
-      const { data, error } = await supabase.rpc("create_student", {
-        class_id: cls.id,
-        name: stuName.trim(),
-        student_no: stuNo.trim(),
-      });
-      if (error) {
-        flashMsg(false, error.message);
-        return;
+    if (isCloudSession) {
+      try {
+        const data = await callCloudAction({
+          action: "add_student",
+          classId: cls.id,
+          name: stuName.trim(),
+          studentNo: stuNo.trim(),
+        });
+        qrPayloadMemoryRef.current[data.id] = data.qr_payload;
+        setStuName("");
+        setStuNo("");
+        flashMsg(true, `Added ${data.name} with printable QR card.`);
+        await loadWorkspace();
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Could not add student.");
       }
-      const qrPayload = String(data);
-      const stuId = qrPayload.split(".")[1] || crypto.randomUUID();
-      setClasses((prev) =>
-        prev.map((c) =>
-          c.id === cls.id
-            ? {
-                ...c,
-                students: [
-                  ...c.students,
-                  {
-                    id: stuId,
-                    name: stuName.trim(),
-                    studentNo: stuNo.trim(),
-                    qrPayload,
-                    createdAt: new Date().toISOString(),
-                  },
-                ],
-              }
-            : c
-        )
-      );
-      setStuName("");
-      setStuNo("");
-      flashMsg(true, "Student added with QR card ready for printing.");
+      return;
+    }
+
+    if (cls.students.some((s) => s.studentNo.toLowerCase() === stuNo.trim().toLowerCase())) {
+      flashMsg(false, `Student number ${stuNo.trim()} already exists in this class.`);
       return;
     }
 
@@ -324,39 +378,33 @@ export function TeacherConsole() {
       return;
     }
 
-    const supabase = getSupabaseBrowserClient();
-    if (session?.authMode === "supabase" && supabase && navigator.onLine) {
-      const { data, error } = await supabase.rpc("import_students", {
-        class_id: cls.id,
-        rows: parsedRows,
-      });
-      if (error) {
-        flashMsg(false, error.message);
-        return;
+    if (isCloudSession) {
+      try {
+        const data = await callCloudAction({
+          action: "import_students",
+          classId: cls.id,
+          rows: parsedRows,
+        });
+        for (const s of data.created || []) {
+          qrPayloadMemoryRef.current[s.id] = s.qr_payload;
+        }
+        setCsvBulk("");
+        flashMsg(
+          true,
+          `Imported ${data.created_count} students (skipped ${data.skipped_count} duplicates).`
+        );
+        await loadWorkspace();
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Bulk import failed.");
       }
-      const createdList = (data.created || []).map(
-        (s: { id: string; name: string; student_no: string; qr_payload: string }) => ({
-          id: s.id,
-          name: s.name,
-          studentNo: s.student_no,
-          qrPayload: s.qr_payload,
-          createdAt: new Date().toISOString(),
-        })
-      );
-      setClasses((prev) =>
-        prev.map((c) => (c.id === cls.id ? { ...c, students: [...c.students, ...createdList] } : c))
-      );
-      setCsvBulk("");
-      flashMsg(
-        true,
-        `Imported ${data.created_count} students (skipped ${data.skipped_count} duplicates).`
-      );
       return;
     }
 
     const addedStudents = [];
+    let skipped = 0;
     for (const row of parsedRows) {
       if (cls.students.some((s) => s.studentNo.toLowerCase() === row.student_no.toLowerCase())) {
+        skipped += 1;
         continue;
       }
       const sid = crypto.randomUUID();
@@ -376,7 +424,111 @@ export function TeacherConsole() {
     await offlineDb.teacherClasses.put(updated);
     setClasses((prev) => prev.map((c) => (c.id === cls.id ? updated : c)));
     setCsvBulk("");
-    flashMsg(true, `Added ${addedStudents.length} student QR passes.`);
+    flashMsg(
+      true,
+      `Added ${addedStudents.length} student QR passes${skipped > 0 ? ` (${skipped} duplicates skipped)` : ""}.`
+    );
+  };
+
+  const handleRegenerateQr = async (studentId: string, studentName: string) => {
+    if (!isCloudSession) return;
+    try {
+      const data = await callCloudAction({ action: "regenerate_qr", studentId });
+      qrPayloadMemoryRef.current[studentId] = data.qr_payload;
+      setClasses((prev) =>
+        prev.map((c) => ({
+          ...c,
+          students: c.students.map((s) =>
+            s.id === studentId ? { ...s, qrPayload: data.qr_payload } : s
+          ),
+        }))
+      );
+      flashMsg(true, `Regenerated QR card for ${studentName} (ready to print).`);
+    } catch (err) {
+      flashMsg(false, err instanceof Error ? err.message : "Could not regenerate QR.");
+    }
+  };
+
+  const handleLoadDemoClassroom = async () => {
+    const bp = GRADE10_BLUEPRINTS[2]; // Quick Checkpoint (5 Items)
+
+    if (isCloudSession) {
+      try {
+        const clsData = await callCloudAction({
+          action: "create_class",
+          name: "Grade 10 - Demo Class",
+        });
+        const imp = await callCloudAction({
+          action: "import_students",
+          classId: clsData.id,
+          rows: DEMO_STUDENTS.map((s) => ({ name: s.name, student_no: s.studentNo })),
+        });
+        for (const s of imp.created || []) {
+          qrPayloadMemoryRef.current[s.id] = s.qr_payload;
+        }
+        await callCloudAction({
+          action: "create_quiz",
+          classId: clsData.id,
+          title: bp.title,
+          description: bp.description,
+          durationMinutes: bp.durationMinutes,
+          instantFeedback: bp.instantFeedback,
+          allowRetry: bp.allowRetry,
+          questions: bp.items,
+        });
+        setSelectedClassId(clsData.id);
+        flashMsg(true, "Loaded demo class with 5 students, QR sheet, and Grade 10 checkpoint quiz!");
+        await loadWorkspace();
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Demo setup failed.");
+      }
+      return;
+    }
+
+    const clsId = crypto.randomUUID();
+    const joinCode = "DEMO10";
+    const students = await Promise.all(
+      DEMO_STUDENTS.map(async (s) => {
+        const sid = crypto.randomUUID();
+        return {
+          id: sid,
+          name: s.name,
+          studentNo: s.studentNo,
+          qrPayload: await buildOfflineStudentIdQr(sid, s.studentNo, s.name, joinCode),
+          createdAt: new Date().toISOString(),
+        };
+      })
+    );
+    const demoCls: LocalTeacherClass = {
+      id: clsId,
+      name: "Grade 10 - Demo Class",
+      joinCode,
+      createdAt: new Date().toISOString(),
+      students,
+    };
+    const demoQuiz: LocalTeacherQuiz = {
+      id: `${bp.id}-${Date.now()}`,
+      title: bp.title,
+      classId: clsId,
+      durationMinutes: bp.durationMinutes,
+      instantFeedback: bp.instantFeedback,
+      allowRetry: bp.allowRetry,
+      status: "ready",
+      createdAt: new Date().toISOString(),
+      questions: bp.items.map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        options: item.options,
+        correctIndex: item.correctIndex,
+        points: item.points,
+      })),
+    };
+    await offlineDb.teacherClasses.put(demoCls);
+    await offlineDb.teacherQuizzes.put(demoQuiz);
+    setClasses((prev) => [demoCls, ...prev]);
+    setQuizzes((prev) => [demoQuiz, ...prev]);
+    setSelectedClassId(clsId);
+    flashMsg(true, "Loaded offline Demo Class (Code: DEMO10) with 5 students and Grade 10 quiz!");
   };
 
   const handleImportGrade10Quiz = async (blueprintId: string) => {
@@ -384,36 +536,23 @@ export function TeacherConsole() {
     if (!bp) return;
     const classId = selectedClassId || classes[0]?.id || "local-default";
 
-    const supabase = getSupabaseBrowserClient();
-    if (session?.authMode === "supabase" && supabase && navigator.onLine && classId !== "local-default") {
-      const { data: qz, error } = await supabase
-        .from("quizzes")
-        .insert({
-          teacher_id: session.userId,
-          class_id: classId,
+    if (isCloudSession && classId !== "local-default") {
+      try {
+        await callCloudAction({
+          action: "create_quiz",
+          classId,
           title: bp.title,
           description: bp.description,
-          duration_minutes: bp.durationMinutes,
-          instant_feedback: bp.instantFeedback,
-          allow_retry: bp.allowRetry,
-        })
-        .select()
-        .single();
-      if (error) {
-        flashMsg(false, error.message);
-        return;
+          durationMinutes: bp.durationMinutes,
+          instantFeedback: bp.instantFeedback,
+          allowRetry: bp.allowRetry,
+          questions: bp.items,
+        });
+        flashMsg(true, `Added "${bp.title}" (${bp.items.length} items) to cloud class.`);
+        await loadWorkspace();
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Could not import quiz.");
       }
-      const qRows = bp.items.map((item, idx) => ({
-        quiz_id: qz.id,
-        question_text: item.prompt,
-        options: item.options,
-        correct_index: item.correctIndex,
-        points: item.points,
-        sort_order: idx,
-      }));
-      await supabase.from("questions").insert(qRows);
-      flashMsg(true, `Added "${bp.title}" (${bp.items.length} items) to Supabase class.`);
-      loadWorkspace();
       return;
     }
 
@@ -469,39 +608,25 @@ export function TeacherConsole() {
     }
     const classId = selectedClassId || classes[0]?.id || "local-default";
 
-    const supabase = getSupabaseBrowserClient();
-    if (session?.authMode === "supabase" && supabase && navigator.onLine && classId !== "local-default") {
-      const { data: qz, error } = await supabase
-        .from("quizzes")
-        .insert({
-          teacher_id: session.userId,
-          class_id: classId,
+    if (isCloudSession && classId !== "local-default") {
+      try {
+        await callCloudAction({
+          action: "create_quiz",
+          classId,
           title: quizTitle.trim(),
           description: "Teacher authored quiz",
-          duration_minutes: quizMins,
-          instant_feedback: instantFb,
-          allow_retry: allowRetry,
-        })
-        .select()
-        .single();
-      if (error) {
-        flashMsg(false, error.message);
-        return;
+          durationMinutes: quizMins,
+          instantFeedback: instantFb,
+          allowRetry,
+          questions: draftQuestions,
+        });
+        setQuizTitle("");
+        setDraftQuestions([]);
+        flashMsg(true, "Saved quiz to Supabase database.");
+        await loadWorkspace();
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Could not save quiz.");
       }
-      await supabase.from("questions").insert(
-        draftQuestions.map((dq, idx) => ({
-          quiz_id: qz.id,
-          question_text: dq.prompt,
-          options: dq.options,
-          correct_index: dq.correctIndex,
-          points: dq.points,
-          sort_order: idx,
-        }))
-      );
-      setQuizTitle("");
-      setDraftQuestions([]);
-      flashMsg(true, "Saved quiz to Supabase.");
-      loadWorkspace();
       return;
     }
 
@@ -577,39 +702,69 @@ export function TeacherConsole() {
   };
 
   const handleStartLiveRun = async (quizId: string) => {
-    const supabase = getSupabaseBrowserClient();
-    if (session?.authMode === "supabase" && supabase && navigator.onLine) {
-      const { data: runId, error } = await supabase.rpc("start_run", { quiz_id: quizId });
-      if (error) {
-        flashMsg(false, error.message);
-        return;
+    if (isCloudSession && session?.sessionToken) {
+      try {
+        const data = await callCloudAction({ action: "start_run", quizId });
+        const runId = String(data.run_id);
+        setActiveRunId(runId);
+        await fetchRunResults(session.sessionToken, runId);
+        flashMsg(true, "Started timed live run! Students in this class can now enter.");
+      } catch (err) {
+        flashMsg(false, err instanceof Error ? err.message : "Could not start live run.");
       }
-      setActiveRunId(String(runId));
-      const { data: rows } = await supabase
-        .from("run_results")
-        .select("*")
-        .eq("run_id", String(runId));
-      setRunResults((rows || []) as RunResultRow[]);
-      flashMsg(true, "Started timed live run in Supabase!");
       return;
     }
     flashMsg(
       true,
-      "Offline mode: Export the .qpack.json file to pass to students, then verify their Result QR or .qres file."
+      "Offline mode: Export the .qpack.json file or Copy Encrypted Link to share with students, then verify their Result QR or .qres files."
     );
   };
 
   const handleEndLiveRun = async () => {
-    if (!activeRunId) return;
-    const supabase = getSupabaseBrowserClient();
-    if (!supabase) return;
-    await supabase.rpc("end_run", { run_id: activeRunId });
-    const { data: rows } = await supabase
-      .from("run_results")
-      .select("*")
-      .eq("run_id", activeRunId);
-    setRunResults((rows || []) as RunResultRow[]);
-    flashMsg(true, "Ended live run and submitted active attempts.");
+    if (!activeRunId || !session?.sessionToken) return;
+    try {
+      await callCloudAction({ action: "end_run", runId: activeRunId });
+      await fetchRunResults(session.sessionToken, activeRunId);
+      setActiveRunId(null);
+      flashMsg(true, "Ended live run and finalized all in-progress attempts.");
+    } catch (err) {
+      flashMsg(false, err instanceof Error ? err.message : "Could not end run.");
+    }
+  };
+
+  const handleExportRunCsv = () => {
+    if (runResults.length === 0) return;
+    const esc = (v: string | number | boolean) => `"${String(v).replace(/"/g, '""')}"`;
+    const headers = [
+      "Student Name",
+      "Student No",
+      "Status",
+      "Answered",
+      "Score",
+      "Max Score",
+      "Late Sync Answers",
+      "Verified",
+    ];
+    const lines = runResults.map((r) => [
+      esc(r.student_name),
+      esc(r.student_no),
+      esc(r.status),
+      esc(r.answered_count),
+      esc(r.score),
+      esc(r.max_score),
+      esc(r.late_answers),
+      esc(r.is_verified ? "YES" : "NO"),
+    ]);
+    const csv = [headers.join(","), ...lines.map((l) => l.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `quizgate_class_results_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const selectedClass = classes.find((c) => c.id === selectedClassId);
@@ -624,8 +779,8 @@ export function TeacherConsole() {
           </h1>
           <p className="text-xs sm:text-sm text-[var(--ink-muted)]">
             {session?.authMode === "supabase"
-              ? "Supabase Cloud Connected — Classes & live runs sync automatically."
-              : "Offline Local Mode — Create classes, generate Student QRs, and export encrypted .qpack.json quizzes."}
+              ? "Cloud Database Connected — Classes, rosters, live runs & QRs sync via username/password."
+              : "Offline Local Mode — Create classes, print Student QRs, and export encrypted .qpack.json quizzes."}
           </p>
         </div>
 
@@ -690,18 +845,28 @@ export function TeacherConsole() {
 
       {tab === "classes" && (
         <div className="space-y-4">
-          <form onSubmit={handleCreateClass} className="qg-card p-4 flex flex-col sm:flex-row gap-2.5">
-            <input
-              className="qg-input flex-1"
-              placeholder="New class name (e.g. Grade 10 - Rizal)"
-              value={newClassName}
-              onChange={(e) => setNewClassName(e.target.value)}
-            />
-            <button type="submit" className="qg-btn qg-btn-primary shrink-0">
-              <Plus className="w-4 h-4" />
-              <span>Create Class</span>
+          <div className="qg-card p-4 flex flex-col sm:flex-row gap-2.5">
+            <form onSubmit={handleCreateClass} className="flex flex-col sm:flex-row gap-2.5 flex-1">
+              <input
+                className="qg-input flex-1"
+                placeholder="New class name (e.g. Grade 10 - Rizal)"
+                value={newClassName}
+                onChange={(e) => setNewClassName(e.target.value)}
+              />
+              <button type="submit" className="qg-btn qg-btn-primary shrink-0">
+                <Plus className="w-4 h-4" />
+                <span>Create Class</span>
+              </button>
+            </form>
+            <button
+              type="button"
+              onClick={handleLoadDemoClassroom}
+              className="qg-btn qg-btn-secondary shrink-0 text-xs"
+            >
+              <Sparkles className="w-4 h-4 text-[var(--primary)]" />
+              <span>Load Demo Classroom</span>
             </button>
-          </form>
+          </div>
 
           {classes.length > 0 && (
             <div className="flex flex-wrap gap-2">
@@ -817,7 +982,7 @@ export function TeacherConsole() {
                     {selectedClass.students.map((st) => (
                       <div
                         key={st.id}
-                        className="p-3 bg-[var(--surface)] flex items-center justify-between gap-2 text-sm"
+                        className="p-3 bg-[var(--surface)] flex flex-wrap items-center justify-between gap-2 text-sm"
                       >
                         <div>
                           <span className="font-semibold">{st.name}</span>{" "}
@@ -825,18 +990,30 @@ export function TeacherConsole() {
                             ({st.studentNo})
                           </span>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => copyText(`stu-${st.id}`, st.qrPayload)}
-                          className="text-xs font-semibold text-[var(--primary)] inline-flex items-center gap-1"
-                        >
-                          {copiedId === `stu-${st.id}` ? (
-                            <Check className="w-3.5 h-3.5" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
+                        <div className="flex items-center gap-3">
+                          {isCloudSession && (
+                            <button
+                              type="button"
+                              onClick={() => handleRegenerateQr(st.id, st.name)}
+                              className="text-xs font-semibold text-[var(--ink-muted)] hover:text-[var(--ink)] inline-flex items-center gap-1"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              <span>Regenerate QR</span>
+                            </button>
                           )}
-                          <span>Copy QR Payload</span>
-                        </button>
+                          <button
+                            type="button"
+                            onClick={() => copyText(`stu-${st.id}`, st.qrPayload)}
+                            className="text-xs font-semibold text-[var(--primary)] inline-flex items-center gap-1"
+                          >
+                            {copiedId === `stu-${st.id}` ? (
+                              <Check className="w-3.5 h-3.5" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                            <span>Copy QR Payload</span>
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1044,18 +1221,46 @@ export function TeacherConsole() {
               </div>
             )}
 
-            {activeRunId && (
+            {runResults.length > 0 && (
               <div className="p-4 rounded-xl border border-blue-500/40 bg-[var(--primary-soft)] space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <h3 className="font-bold text-sm">Live Run Roster</h3>
-                  <button
-                    type="button"
-                    onClick={handleEndLiveRun}
-                    className="qg-btn qg-btn-secondary text-xs text-red-600"
-                  >
-                    <Square className="w-3.5 h-3.5" />
-                    <span>End Run</span>
-                  </button>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="font-bold text-sm">
+                    Live Run Roster ({runResults.length} Students)
+                  </h3>
+                  <div className="flex flex-wrap gap-2">
+                    {activeRunId && session?.sessionToken && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          session.sessionToken && fetchRunResults(session.sessionToken, activeRunId)
+                        }
+                        className="qg-btn qg-btn-secondary text-xs min-h-[34px]"
+                      >
+                        <RefreshCw
+                          className={`w-3.5 h-3.5 ${refreshingRoster ? "animate-spin" : ""}`}
+                        />
+                        <span>Refresh</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleExportRunCsv}
+                      className="qg-btn qg-btn-secondary text-xs min-h-[34px]"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Export CSV</span>
+                    </button>
+                    {activeRunId && (
+                      <button
+                        type="button"
+                        onClick={handleEndLiveRun}
+                        className="qg-btn qg-btn-secondary text-xs text-red-600 min-h-[34px]"
+                      >
+                        <Square className="w-3.5 h-3.5" />
+                        <span>End Run</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs text-left">

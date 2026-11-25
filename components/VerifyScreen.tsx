@@ -127,11 +127,21 @@ export function VerifyScreen() {
     try {
       if (navigator.onLine) {
         let authHeader: Record<string, string> = {};
-        const supabase = getSupabaseBrowserClient();
-        if (supabase) {
-          const { data: sessData } = await supabase.auth.getSession();
-          if (sessData.session?.access_token) {
-            authHeader = { Authorization: `Bearer ${sessData.session.access_token}` };
+        const activeSess = offlineDb ? await offlineDb.session.get("active") : null;
+        if (
+          activeSess?.role === "teacher" &&
+          activeSess.authMode === "supabase" &&
+          activeSess.sessionToken &&
+          !activeSess.sessionToken.startsWith("offline_")
+        ) {
+          authHeader = { Authorization: `Bearer ${activeSess.sessionToken}` };
+        } else {
+          const supabase = getSupabaseBrowserClient();
+          if (supabase) {
+            const { data: sessData } = await supabase.auth.getSession();
+            if (sessData.session?.access_token) {
+              authHeader = { Authorization: `Bearer ${sessData.session.access_token}` };
+            }
           }
         }
 
@@ -193,15 +203,22 @@ export function VerifyScreen() {
     setLoading(false);
   };
 
-  const handleUploadResultFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
+  const handleUploadResultFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    let verifiedCount = 0;
+    let failedCount = 0;
+    let lastValidSub: OfflineResultPlainPayload | undefined;
+    let lastError = "";
+
+    for (const file of files) {
       try {
-        const packet = JSON.parse(String(ev.target?.result)) as EncryptedResultPacket;
+        const text = await file.text();
+        const packet = JSON.parse(text) as EncryptedResultPacket;
         const plain = await decryptResultPacket(packet);
-        setFileOutcome({ valid: true, submission: plain });
+        verifiedCount += 1;
+        lastValidSub = plain;
 
         if (offlineDb) {
           await offlineDb.verificationLogs.add({
@@ -214,18 +231,30 @@ export function VerifyScreen() {
             verifiedVia: "offline",
             rawCode: packet.sig,
           });
-          loadLogs();
         }
       } catch (err) {
-        setFileOutcome({
-          valid: false,
-          reason: err instanceof Error ? err.message : "Could not verify encrypted result file.",
-        });
-      } finally {
-        if (fileRef.current) fileRef.current.value = "";
+        failedCount += 1;
+        lastError = err instanceof Error ? err.message : "Could not verify encrypted result file.";
       }
-    };
-    reader.readAsText(file);
+    }
+
+    if (files.length === 1 && lastValidSub && failedCount === 0) {
+      setFileOutcome({ valid: true, submission: lastValidSub });
+    } else if (verifiedCount > 0) {
+      setFileOutcome({
+        valid: true,
+        submission: lastValidSub,
+        reason: `Verified ${verifiedCount} of ${files.length} files (${failedCount} invalid).`,
+      });
+    } else {
+      setFileOutcome({
+        valid: false,
+        reason: lastError || "Could not verify uploaded file(s).",
+      });
+    }
+
+    await loadLogs();
+    if (fileRef.current) fileRef.current.value = "";
   };
 
   const exportCsv = () => {
@@ -408,14 +437,15 @@ export function VerifyScreen() {
               ref={fileRef}
               type="file"
               accept=".json,.qres.json"
+              multiple
               className="hidden"
               onChange={handleUploadResultFile}
             />
             <Upload className="w-10 h-10 text-[var(--primary)] mx-auto" />
             <div>
-              <h2 className="font-bold text-base">Import Student .qres.json Submission</h2>
+              <h2 className="font-bold text-base">Import Student .qres.json Submission(s)</h2>
               <p className="text-xs text-[var(--ink-muted)] mt-1">
-                Decrypts the student&apos;s offline submission file and validates its integrity seal.
+                Select one or multiple encrypted submission files to verify scores and export CSV.
               </p>
             </div>
             <button
@@ -423,7 +453,7 @@ export function VerifyScreen() {
               onClick={() => fileRef.current?.click()}
               className="qg-btn qg-btn-primary"
             >
-              Choose .qres.json File
+              Choose .qres.json File(s)
             </button>
           </div>
 

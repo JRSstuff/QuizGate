@@ -10,7 +10,8 @@ export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   const ip = req.headers.get("x-forwarded-for") || "local";
-  const rl = checkRateLimit(`student_reg:${ip}`, 15, 60000);
+  // Classroom school Wi-Fi NAT limit: up to 80 self-registrations/min per shared router IP
+  const rl = checkRateLimit(`student_reg:${ip}`, 80, 60000);
   if (!rl.allowed) {
     return NextResponse.json(
       { error: "Too many registration attempts. Please wait a minute." },
