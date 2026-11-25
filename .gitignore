@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js build outputs
+.next/
+out/
+build/
+dist/
+
+# Local data & tests
+.data/
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Environment variables
+.env
+.env*.local
+
+# Misc
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+.vercel
