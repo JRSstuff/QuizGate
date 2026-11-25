@@ -28,7 +28,7 @@ export function QrCanvas({
     QRCode.toCanvas(cv, value, {
       width: size,
       margin: 2,
-      errorCorrectionLevel: "M",
+      errorCorrectionLevel: value.length > 750 ? "L" : "M",
       color: {
         dark: "#0f172a",
         light: "#ffffff",

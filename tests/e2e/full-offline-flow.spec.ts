@@ -128,8 +128,9 @@ test.describe("QuizGate PWA: Registration, Study Scenario Fix, Encrypted Offline
     await expect(page.locator("body")).toContainText("Serverless Verifier API");
   });
 
-  test("teacher registers with string username (no email), loads 5-student Demo Classroom, adds & prints QRs, and loads quiz", async ({
+  test("teacher registers (no email), creates class, starts live offline run, sees newly registered student in roster, and collects separate-phone student Result QR", async ({
     page,
+    browser,
   }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
 
@@ -143,26 +144,110 @@ test.describe("QuizGate PWA: Registration, Study Scenario Fix, Encrypted Offline
     await page.waitForURL("**/teacher");
     await expect(page.locator("h1")).toContainText("Teacher Console · Ms. Rivera");
 
-    // 2. Click Load Demo Classroom -> creates 5 demo students + class + Grade 10 checkpoint quiz
-    await page.locator("button:has-text('Load Demo Classroom')").click();
-    await expect(page.locator("h2", { hasText: "Grade 10 - Demo Class" })).toBeVisible();
-    await expect(page.locator("body")).toContainText("Enrolled Students (5)");
-    await expect(page.locator("body")).toContainText("Dela Cruz, Juan");
+    // 2. Create class -> capture Join Code
+    await page.locator("input[placeholder*='Grade 10 - Rizal']").fill("Grade 10 - Rizal");
+    await page.locator("button:has-text('Create Class')").click();
+    await expect(page.locator("h2", { hasText: "Grade 10 - Rizal" })).toBeVisible();
+    const joinCode = (
+      await page.locator("p:has-text('Student Join Code:') code").textContent()
+    )?.trim() || "";
+    expect(joinCode.length).toBeGreaterThanOrEqual(4);
 
-    // Add a 6th student manually
-    await page.locator("input[placeholder*='Juan Dela Cruz']").fill("Bonifacio, Andres");
-    await page.locator("input[placeholder*='2026-0001']").fill("2026-0301");
-    await page.locator("button:has-text('Add')").first().click();
-    await expect(page.locator("body")).toContainText("Enrolled Students (6)");
-
-    // Check Printable QR Sheet renders all student QR cards cleanly
-    await page.getByRole("button", { name: "QR Sheet", exact: true }).click();
-    await expect(page.locator("canvas[aria-label='Dela Cruz, Juan']")).toBeVisible();
-    await expect(page.locator("canvas[aria-label='Bonifacio, Andres']")).toBeVisible();
-
-    // Check Demo Grade 10 Quiz exists in Quizzes tab
+    // 3. Load Grade 10 checkpoint quiz & Start Run -> must immediately show Live Run Dashboard + Classroom Quiz QR
     await page.getByRole("button", { name: /^Quizzes/ }).click();
-    await expect(page.locator("body")).toContainText("Quick Checkpoint (5 Items)");
-    await expect(page.locator("body")).toContainText("5 items");
+    await page.locator("button:has-text('Quick Checkpoint (5 Items)')").click();
+    await page.locator("button:has-text('Start Run')").first().click();
+
+    await expect(page.locator("body")).toContainText("Live Run Active");
+    await expect(page.locator("canvas[aria-label='Classroom Quiz QR']")).toBeVisible();
+    const classroomQuizQrPayload =
+      (
+        await page
+          .locator("code", { hasText: /^QPK[01]\./ })
+          .first()
+          .textContent()
+      )?.trim() || "";
+    expect(classroomQuizQrPayload).toMatch(/^QPK[01]\./);
+
+    // 4. Same-device Student registers using Teacher's Join Code -> answers 5/5 -> auto-enrolls & updates roster
+    await page.goto(`/auth?role=student&tab=register&join=${encodeURIComponent(joinCode)}`);
+    await page.locator("input[placeholder*='Dela Cruz']").fill("Dela Cruz, Mateo");
+    await page.locator("input[placeholder='2026-0001']").fill("2026-0777");
+    await page.locator("input[placeholder='Enter PIN or password']").fill("123456");
+    await page.locator("button:has-text('Create Student Account & QR Pass')").click();
+    await page.locator("button:has-text('Continue to Student Workspace')").click();
+    await page.waitForURL("**/student");
+
+    await expect(page.locator("body")).toContainText("Teacher Started Classroom Quiz · Grade 10 - Rizal");
+    await page.locator("button:has-text('Start Classroom Quiz')").click();
+    await page.waitForURL("**/student/play**");
+
+    const letters = ["B", "C", "B", "C", "B"];
+    for (let i = 0; i < 5; i++) {
+      await page.locator("button", { hasText: new RegExp(`^${letters[i]}`) }).first().click();
+      if (i < 4) await page.locator("button:has-text('Next Question')").click();
+      else await page.locator("button:has-text('Finish & Generate QR')").click();
+    }
+    await expect(page.locator("body")).toContainText("5 / 5");
+
+    // 5. Simulate a SECOND separate phone offline (isolated browser context!) scanning Teacher's Quiz QR & scoring 4/5
+    const phone2Ctx = await browser.newContext();
+    const phone2Page = await phone2Ctx.newPage();
+    await phone2Page.goto("/auth?role=student&tab=register&join=SELF");
+    await phone2Page.locator("input[placeholder*='Dela Cruz']").fill("Santos, Ana");
+    await phone2Page.locator("input[placeholder='2026-0001']").fill("2026-0888");
+    await phone2Page.locator("input[placeholder='Enter PIN or password']").fill("654321");
+    await phone2Page.locator("button:has-text('Create Student Account & QR Pass')").click();
+    await phone2Page.locator("button:has-text('Continue to Student Workspace')").click();
+    await phone2Page.waitForURL("**/student");
+
+    await phone2Ctx.setOffline(true);
+    await phone2Page.locator("button:has-text('Scan Quiz QR')").click();
+    await phone2Page.locator("input[placeholder*='QPK1']").fill(classroomQuizQrPayload);
+    await phone2Page.locator("button:has-text('Load')").first().click();
+
+    await phone2Page.locator(".qg-card", { hasText: "Quick Checkpoint (5 Items)" }).first().locator("button:has-text('Start Quiz')").click();
+    await phone2Page.waitForURL("**/student/play**");
+    // Answer 4 right, 1st wrong -> dismiss modal -> 4/5
+    const phone2Letters = ["A", "C", "B", "C", "B"];
+    for (let i = 0; i < 5; i++) {
+      await phone2Page.locator("button", { hasText: new RegExp(`^${phone2Letters[i]}`) }).first().click();
+      const modal = phone2Page.locator("div[role='dialog']");
+      if (await modal.isVisible().catch(() => false)) {
+        await modal.locator("button:has-text('Continue')").click();
+      }
+      if (i < 4) await phone2Page.locator("button:has-text('Next Question')").click();
+      else await phone2Page.locator("button:has-text('Finish & Generate QR')").click();
+    }
+    await expect(phone2Page.locator("body")).toContainText("4 / 5");
+    const anaResultQr = (await phone2Page.locator("code").last().textContent())?.trim() || "";
+    expect(anaResultQr).toMatch(/^QG1O\./);
+    await phone2Ctx.close();
+
+    // 6. Teacher logs back in on Teacher Console -> sees Enrolled Student (NOT 0!), Mateo's 5/5, AND collects Ana's 4/5 Result QR!
+    await page.goto("/auth?role=teacher&tab=login");
+    await page.locator("input[placeholder*='teacher_dioso']").fill("teacher_rivera");
+    await page.locator("input[placeholder='Password']").fill("securepass123");
+    await page.locator("button:has-text('Sign In to Teacher Console')").click();
+    await page.waitForURL("**/teacher");
+
+    await expect(page.locator("body")).toContainText("Enrolled Students (1)");
+    await expect(page.locator("body")).toContainText("Dela Cruz, Mateo");
+
+    await page.getByRole("button", { name: /^Quizzes/ }).click();
+    await expect(page.locator("body")).toContainText("Dela Cruz, Mateo");
+    await expect(page.locator("body")).toContainText("5/5");
+
+    // Collect 2nd phone offline student Result QR directly inside Run Roster
+    await page.locator("input[placeholder*='QG1O']").fill(anaResultQr);
+    await page.locator("button:has-text('Record Score')").click();
+
+    await expect(page.locator("body")).toContainText("2/2 Recorded");
+    await expect(page.locator("body")).toContainText("Santos, Ana");
+    await expect(page.locator("body")).toContainText("4/5");
+
+    // End the Run cleanly
+    await page.locator("button:has-text('End Run')").click();
+    await expect(page.locator("body")).toContainText("Run Ended");
   });
 });

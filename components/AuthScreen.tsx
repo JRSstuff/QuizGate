@@ -177,6 +177,66 @@ function AuthScreenInner() {
         };
       }
 
+      // If registering locally/offline with a Teacher class code present on this device, enroll in that class roster & any active run!
+      let matchedClassName = data.student.class_name;
+      let matchedClassId = data.student.class_id;
+      if (data.mode === "offline" && cleanCode !== "SELF") {
+        const allClasses = await offlineDb.teacherClasses.toArray();
+        const localCls = allClasses.find((c) => c.joinCode.toUpperCase() === cleanCode);
+        if (localCls) {
+          matchedClassId = localCls.id;
+          matchedClassName = localCls.name;
+          const alreadyEnrolled = localCls.students.some(
+            (s) => s.studentNo.toLowerCase() === data.student.student_no.toLowerCase()
+          );
+          if (!alreadyEnrolled) {
+            await offlineDb.teacherClasses.put({
+              ...localCls,
+              students: [
+                ...localCls.students,
+                {
+                  id: data.student.id,
+                  name: data.student.name,
+                  studentNo: data.student.student_no,
+                  qrPayload: data.qr_payload,
+                  createdAt: new Date().toISOString(),
+                },
+              ],
+            });
+          }
+
+          // Also add student to any currently running local runs for this class
+          const activeRuns = await offlineDb.teacherRuns
+            .where("classId")
+            .equals(localCls.id)
+            .toArray();
+          for (const run of activeRuns) {
+            const existsInRun = run.results.some(
+              (r) => r.studentNo.toLowerCase() === data.student.student_no.toLowerCase()
+            );
+            if (!existsInRun) {
+              await offlineDb.teacherRuns.put({
+                ...run,
+                results: [
+                  ...run.results,
+                  {
+                    studentId: data.student.id,
+                    studentName: data.student.name,
+                    studentNo: data.student.student_no,
+                    status: "not_started",
+                    answeredCount: 0,
+                    score: 0,
+                    maxScore: run.maxScore,
+                    lateAnswers: 0,
+                    verified: false,
+                  },
+                ],
+              });
+            }
+          }
+        }
+      }
+
       const pinHash = await sha256Hex(`${cleanNo.toLowerCase()}:${cleanPin}`);
       await offlineDb.accounts.put({
         id: data.student.id,
@@ -185,7 +245,7 @@ function AuthScreenInner() {
         identifier: data.student.student_no.toLowerCase(),
         pinHash,
         classCode: cleanCode,
-        className: data.student.class_name,
+        className: matchedClassName,
         qrPayload: data.qr_payload,
         createdAt: new Date().toISOString(),
       });
@@ -196,9 +256,9 @@ function AuthScreenInner() {
         userId: data.student.id,
         name: data.student.name,
         identifier: data.student.student_no,
-        classId: data.student.class_id,
+        classId: matchedClassId,
         classCode: cleanCode,
-        className: data.student.class_name,
+        className: matchedClassName,
         qrPayload: data.qr_payload,
         authMode: data.mode,
         sessionToken: data.session_token,
@@ -333,13 +393,42 @@ function AuthScreenInner() {
           sessionToken: data.session_token,
         });
       } else {
+        const cleanCode = (parsed.classCode || "SELF").toUpperCase();
+        let matchedClassId: string | undefined;
+        let matchedClassName: string | undefined;
+        if (cleanCode !== "SELF") {
+          const allClasses = await offlineDb.teacherClasses.toArray();
+          const localCls = allClasses.find((c) => c.joinCode.toUpperCase() === cleanCode);
+          if (localCls) {
+            matchedClassId = localCls.id;
+            matchedClassName = localCls.name;
+            const sNo = parsed.studentNo || "UNREG";
+            if (!localCls.students.some((s) => s.studentNo.toLowerCase() === sNo.toLowerCase())) {
+              await offlineDb.teacherClasses.put({
+                ...localCls,
+                students: [
+                  ...localCls.students,
+                  {
+                    id: parsed.studentId,
+                    name: parsed.studentName || "Student",
+                    studentNo: sNo,
+                    qrPayload: clean,
+                    createdAt: new Date().toISOString(),
+                  },
+                ],
+              });
+            }
+          }
+        }
         await offlineDb.session.put({
           key: "active",
           role: "student",
           userId: parsed.studentId,
           name: parsed.studentName || "Student",
           identifier: parsed.studentNo || "UNREG",
-          classCode: parsed.classCode || "SELF",
+          classId: matchedClassId,
+          classCode: cleanCode,
+          className: matchedClassName,
           qrPayload: clean,
           authMode: "offline",
           sessionToken: `offline_${parsed.studentId}`,

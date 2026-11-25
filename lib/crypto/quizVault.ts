@@ -223,7 +223,24 @@ export async function encryptQuizPack(
   const cleanPass = (passcode || "").trim();
   const aesKey = await deriveAesKey(cleanPass || "pack", salt);
 
-  const plaintextBytes = new TextEncoder().encode(JSON.stringify(payload));
+  const jsonPlain = JSON.stringify(payload);
+  let plaintextBytes: Uint8Array = new TextEncoder().encode(jsonPlain);
+  if (typeof CompressionStream !== "undefined") {
+    try {
+      const stream = new Blob([toArrayBuffer(plaintextBytes)])
+        .stream()
+        .pipeThrough(new CompressionStream("deflate-raw"));
+      const compBytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      if (compBytes.byteLength + 4 < plaintextBytes.byteLength) {
+        const tagged = new Uint8Array(4 + compBytes.byteLength);
+        tagged.set([0x44, 0x5a, 0x31, 0x3a], 0); // "DZ1:"
+        tagged.set(compBytes, 4);
+        plaintextBytes = tagged;
+      }
+    } catch {
+      // Keep uncompressed UTF-8 JSON if compression is unsupported
+    }
+  }
   const encryptedBuf = await cryptoApi.subtle.encrypt(
     { name: "AES-GCM", iv: toArrayBuffer(iv) },
     aesKey,
@@ -289,7 +306,25 @@ export async function decryptQuizPack(
       aesKey,
       toArrayBuffer(fromBase64(pack.ciphertext))
     );
-    const json = new TextDecoder().decode(new Uint8Array(decryptedBuf));
+    const decBytes = new Uint8Array(decryptedBuf);
+    if (
+      decBytes.byteLength >= 4 &&
+      decBytes[0] === 0x44 &&
+      decBytes[1] === 0x5a &&
+      decBytes[2] === 0x31 &&
+      decBytes[3] === 0x3a
+    ) {
+      if (typeof DecompressionStream === "undefined") {
+        throw new Error("Compressed quiz pack requires a modern browser.");
+      }
+      const rawDeflated = decBytes.slice(4);
+      const stream = new Blob([toArrayBuffer(rawDeflated)])
+        .stream()
+        .pipeThrough(new DecompressionStream("deflate-raw"));
+      const json = await new Response(stream).text();
+      return JSON.parse(json) as QuizPackPlainPayload;
+    }
+    const json = new TextDecoder().decode(decBytes);
     return JSON.parse(json) as QuizPackPlainPayload;
   } catch {
     throw new Error(
@@ -514,4 +549,62 @@ export async function parseStudentIdQr(qr: string): Promise<{
   }
 
   return { kind: "offline_id_qr", studentId: "", valid: false, reason: "Unrecognized student QR card format." };
+}
+
+/**
+ * Compresses an EncryptedQuizPack into a compact scannable QR string (`QPK1.<deflated_b64url>`)
+ * when browser/Node CompressionStream is available, otherwise `QPK0.<b64url>`.
+ */
+export async function encodeCompactQuizQr(pack: EncryptedQuizPack): Promise<string> {
+  const json = JSON.stringify(pack);
+  if (typeof CompressionStream !== "undefined") {
+    try {
+      const stream = new Blob([json]).stream().pipeThrough(new CompressionStream("deflate-raw"));
+      const buf = await new Response(stream).arrayBuffer();
+      const b64 = toBase64(new Uint8Array(buf))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+      return `QPK1.${b64}`;
+    } catch {
+      // Fall back to uncompressed base64url
+    }
+  }
+  return `QPK0.${encodeUtf8Base64Url(json)}`;
+}
+
+/** Decodes a QR string (`QPK1.*` or `QPK0.*`), share URL (`?pack=...`), or raw `.qpack.json` text into an EncryptedQuizPack. */
+export async function importAnyQuizInput(rawInput: string): Promise<EncryptedQuizPack> {
+  const clean = rawInput.trim();
+  if (!clean) throw new Error("Empty quiz payload.");
+
+  let parsed: EncryptedQuizPack;
+
+  if (clean.startsWith("QPK1.")) {
+    if (typeof DecompressionStream === "undefined") {
+      throw new Error("Compressed Quiz QR is not supported by this browser; import .qpack.json instead.");
+    }
+    const b64url = clean.slice(5);
+    const padded = b64url.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64url.length + 3) % 4);
+    const bytes = fromBase64(padded);
+    const stream = new Blob([toArrayBuffer(bytes)]).stream().pipeThrough(
+      new DecompressionStream("deflate-raw")
+    );
+    const text = await new Response(stream).text();
+    parsed = JSON.parse(text) as EncryptedQuizPack;
+  } else if (clean.startsWith("QPK0.")) {
+    parsed = JSON.parse(decodeUtf8Base64Url(clean.slice(5))) as EncryptedQuizPack;
+  } else if (clean.startsWith("http://") || clean.startsWith("https://") || clean.includes("pack=")) {
+    const queryPart = clean.includes("?") ? clean.split("?")[1] : clean;
+    const token = new URLSearchParams(queryPart).get("pack");
+    if (!token) throw new Error("URL does not contain an encrypted ?pack= payload.");
+    parsed = JSON.parse(decodeUtf8Base64Url(token)) as EncryptedQuizPack;
+  } else {
+    parsed = JSON.parse(clean) as EncryptedQuizPack;
+  }
+
+  if (!parsed || parsed.kind !== "QGATE_PACK") {
+    throw new Error("Invalid encrypted QuizGate pack format.");
+  }
+  return parsed;
 }

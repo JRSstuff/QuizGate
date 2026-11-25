@@ -30,6 +30,7 @@ import {
   type LocalAttemptRecord,
 } from "@/lib/offline/storage";
 import { flushStudentSyncQueue } from "@/lib/offline/syncEngine";
+import { syncStudentAttemptToLocalRuns } from "@/lib/offline/runRosterSync";
 import {
   calculateRemainingSeconds,
   formatCountdown,
@@ -70,6 +71,7 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
 
   const [session, setSession] = useState<ActiveSession | null>(null);
   const [attemptId, setAttemptId] = useState("");
+  const [attemptStartedAt, setAttemptStartedAt] = useState("");
   const [answersMap, setAnswersMap] = useState<Record<string, StudentSubmissionAnswer>>({});
   const [currentIdx, setCurrentIdx] = useState(0);
 
@@ -220,9 +222,22 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
         }
 
         const startedIso = prev?.startedAt || new Date().toISOString();
-        const endDate = new Date(
-          Date.parse(startedIso) + plain.durationMinutes * 60 * 1000
-        ).toISOString();
+        setAttemptStartedAt(startedIso);
+
+        // If a local teacher started a live run for this quiz & class, use its server/teacher endsAt!
+        const allLocalRuns = await offlineDb.teacherRuns.toArray();
+        const matchingRun = allLocalRuns.find(
+          (r) =>
+            r.status === "running" &&
+            (r.quizId === actualId || r.quizTitle === plain.title) &&
+            (!sess?.classCode ||
+              sess.classCode.toUpperCase() === r.joinCode.toUpperCase() ||
+              sess.classId === r.classId)
+        );
+
+        const endDate = matchingRun
+          ? matchingRun.endsAt
+          : new Date(Date.parse(startedIso) + plain.durationMinutes * 60 * 1000).toISOString();
         setEndsAtIso(endDate);
 
         if (!prev) {
@@ -420,7 +435,7 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
         status: "in_progress",
         score: scoreNow,
         maxScore: maxNow,
-        startedAt: new Date().toISOString(),
+        startedAt: attemptStartedAt || new Date().toISOString(),
         lateCount: 0,
         syncStatus: "offline_only",
         payload: {
@@ -430,12 +445,26 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
           studentId: session?.userId || "guest",
           studentName: stuName,
           studentNo: stuNo,
+          classCode: session?.classCode,
           score: scoreNow,
           maxScore: maxNow,
           lateCount: 0,
           submittedAt: "",
           answers: answersArr,
         },
+      });
+      await syncStudentAttemptToLocalRuns({
+        packOrRunId: actualId,
+        title: quizTitle,
+        studentId: session?.userId || "guest",
+        studentName: stuName,
+        studentNo: stuNo,
+        classId: session?.classId,
+        classCode: session?.classCode,
+        status: "in_progress",
+        answeredCount: answersArr.length,
+        score: scoreNow,
+        maxScore: maxNow,
       });
     } else {
       await flushSyncQueue();
@@ -525,7 +554,7 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
       status: "submitted",
       score,
       maxScore,
-      startedAt: submittedAt,
+      startedAt: attemptStartedAt || submittedAt,
       submittedAt,
       lateCount: 0,
       resultQr,
@@ -534,6 +563,20 @@ export function QuizRunner({ targetId }: QuizRunnerProps) {
     };
 
     await offlineDb.attempts.put(rec);
+    await syncStudentAttemptToLocalRuns({
+      packOrRunId: actualId,
+      title: quizTitle,
+      studentId: session?.userId || "guest",
+      studentName: stuName,
+      studentNo: stuNo,
+      classId: session?.classId,
+      classCode: session?.classCode,
+      status: "submitted",
+      answeredCount: answersArr.length,
+      score,
+      maxScore,
+      recordedAt: submittedAt,
+    });
     setFinishedRecord(rec);
   };
 

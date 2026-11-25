@@ -5,9 +5,11 @@ import {
   decodeUtf8Base64Url,
   decryptQuizPack,
   decryptResultPacket,
+  encodeCompactQuizQr,
   encodeUtf8Base64Url,
   encryptQuizPack,
   encryptResultPacket,
+  importAnyQuizInput,
   parseStudentIdQr,
   verifyOfflineOrFormatQr,
   type OfflineResultPlainPayload,
@@ -127,5 +129,21 @@ describe("QuizGate AES-256-GCM Encrypted Vault & QR Cryptography", () => {
     // Unicode URL-safe base64 roundtrip
     const encoded = encodeUtf8Base64Url("José & María");
     expect(decodeUtf8Base64Url(encoded)).toBe("José & María");
+  });
+
+  it("compresses encrypted quizzes into compact QPK1 QR payloads and imports share URLs cleanly", async () => {
+    const encrypted = await encryptQuizPack(samplePlain);
+    const compactQr = await encodeCompactQuizQr(encrypted);
+    expect(compactQr.startsWith("QPK1.") || compactQr.startsWith("QPK0.")).toBe(true);
+    expect(compactQr.length).toBeLessThan(1500);
+
+    const decodedFromQr = await importAnyQuizInput(compactQr);
+    expect(decodedFromQr.id).toBe(encrypted.id);
+    const plainFromQr = await decryptQuizPack(decodedFromQr);
+    expect(plainFromQr.questions[0].prompt).toBe(samplePlain.questions[0].prompt);
+
+    const shareUrl = `https://quizgate.vercel.app/student?pack=${encodeUtf8Base64Url(JSON.stringify(encrypted))}`;
+    const decodedFromUrl = await importAnyQuizInput(shareUrl);
+    expect(decodedFromUrl.title).toBe(encrypted.title);
   });
 });

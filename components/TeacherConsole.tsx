@@ -3,7 +3,10 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import {
+  Camera,
   Check,
+  CheckCircle2,
+  Clock,
   Copy,
   Download,
   FileKey2,
@@ -16,25 +19,36 @@ import {
   ScanLine,
   Sparkles,
   Square,
+  Upload,
   Users,
 } from "lucide-react";
 import {
   buildOfflineStudentIdQr,
+  decryptResultPacket,
+  encodeCompactQuizQr,
   encodeUtf8Base64Url,
-  encryptQuizPack,
+  verifyOfflineOrFormatQr,
+  type EncryptedResultPacket,
 } from "@/lib/crypto/quizVault";
-import { GRADE10_BLUEPRINTS, toVaultQuestions } from "@/lib/data/grade10Math";
+import { GRADE10_BLUEPRINTS } from "@/lib/data/grade10Math";
+import {
+  buildEncryptedPackFromTeacherQuiz,
+  mergeLocalAttemptsIntoRun,
+  upsertStudentScoreInRun,
+} from "@/lib/offline/runRosterSync";
 import {
   offlineDb,
   type ActiveSession,
   type LocalTeacherClass,
   type LocalTeacherQuiz,
+  type LocalTeacherRun,
 } from "@/lib/offline/storage";
+import { calculateRemainingSeconds, formatCountdown } from "@/lib/timer/clockSync";
 import { QrCanvas } from "./QrCanvas";
 
 type TeacherTab = "classes" | "quizzes" | "print";
 
-interface RunResultRow {
+interface CloudRunResultRow {
   student_id: string;
   student_name: string;
   student_no: string;
@@ -60,6 +74,7 @@ export function TeacherConsole() {
   const [classes, setClasses] = useState<LocalTeacherClass[]>([]);
   const [quizzes, setQuizzes] = useState<LocalTeacherQuiz[]>([]);
   const [selectedClassId, setSelectedClassId] = useState<string>("");
+  const [serviceDbConfigured, setServiceDbConfigured] = useState<boolean | null>(null);
 
   // Create class & add students
   const [newClassName, setNewClassName] = useState("");
@@ -82,20 +97,43 @@ export function TeacherConsole() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
-  // Supabase Live Roster state
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [runResults, setRunResults] = useState<RunResultRow[]>([]);
+  // Cloud Live Roster state
+  const [activeCloudRunId, setActiveCloudRunId] = useState<string | null>(null);
+  const [cloudRunResults, setCloudRunResults] = useState<CloudRunResultRow[]>([]);
   const [refreshingRoster, setRefreshingRoster] = useState(false);
 
-  // Remember newly generated/regenerated cloud student QR payloads in memory for printing
+  // Offline / Local Classroom Run + Score Collector state
+  const [localRuns, setLocalRuns] = useState<LocalTeacherRun[]>([]);
+  const [selectedLocalRunId, setSelectedLocalRunId] = useState<string | null>(null);
+  const [localRunRemainingSecs, setLocalRunRemainingSecs] = useState<number | null>(null);
+  const [runQuizQr, setRunQuizQr] = useState<{ title: string; qr: string } | null>(null);
+  const [runResultQrInput, setRunResultQrInput] = useState("");
+  const [runCameraOpen, setRunCameraOpen] = useState(false);
+
   const qrPayloadMemoryRef = useRef<Record<string, string>>({});
+  const runPanelRef = useRef<HTMLDivElement | null>(null);
+  const resultFileRef = useRef<HTMLInputElement | null>(null);
+  const runScannerRef = useRef<{ stop: () => Promise<void>; clear: () => void } | null>(null);
 
   const flashMsg = (ok: boolean, text: string) => {
     setStatusMsg({ ok, text });
-    setTimeout(() => setStatusMsg(null), 5000);
+    setTimeout(() => setStatusMsg(null), 5500);
   };
 
-  const fetchRunResults = async (token: string, runId: string) => {
+  const stopRunScanner = async () => {
+    if (runScannerRef.current) {
+      try {
+        await runScannerRef.current.stop();
+        runScannerRef.current.clear();
+      } catch {
+        // Ignore cleanup failure
+      }
+      runScannerRef.current = null;
+      setRunCameraOpen(false);
+    }
+  };
+
+  const fetchCloudRunResults = async (token: string, runId: string) => {
     setRefreshingRoster(true);
     try {
       const res = await fetch(
@@ -104,15 +142,33 @@ export function TeacherConsole() {
       );
       if (res.ok) {
         const data = await res.json();
-        setRunResults((data.results || []) as RunResultRow[]);
+        setCloudRunResults((data.results || []) as CloudRunResultRow[]);
         if (data.run?.status === "ended") {
-          setActiveRunId(null);
+          setActiveCloudRunId(null);
         }
       }
     } catch {
-      // Keep last known roster when transiently offline
+      // Keep last known roster
     } finally {
       setRefreshingRoster(false);
+    }
+  };
+
+  const loadLocalRuns = async (preferredId?: string) => {
+    if (!offlineDb) return;
+    const rawRuns = await offlineDb.teacherRuns.orderBy("startedAt").reverse().toArray();
+    const mergedRuns: LocalTeacherRun[] = [];
+    for (const r of rawRuns) {
+      const m = await mergeLocalAttemptsIntoRun(r);
+      if (m !== r) await offlineDb.teacherRuns.put(m);
+      mergedRuns.push(m);
+    }
+    setLocalRuns(mergedRuns);
+    if (preferredId) {
+      setSelectedLocalRunId(preferredId);
+    } else if (!selectedLocalRunId && mergedRuns.length > 0) {
+      const running = mergedRuns.find((r) => r.status === "running");
+      setSelectedLocalRunId((running || mergedRuns[0]).id);
     }
   };
 
@@ -121,6 +177,13 @@ export function TeacherConsole() {
     const sess = (await offlineDb.session.get("active")) || null;
     const activeTeacher = sess?.role === "teacher" ? sess : null;
     setSession(activeTeacher);
+
+    if (navigator.onLine) {
+      fetch("/api/health")
+        .then((r) => r.json())
+        .then((h) => setServiceDbConfigured(Boolean(h.supabaseServiceConfigured)))
+        .catch(() => {});
+    }
 
     if (
       activeTeacher?.authMode === "supabase" &&
@@ -203,13 +266,13 @@ export function TeacherConsole() {
 
           const latestActive = data.active_runs?.[0]?.id || null;
           if (latestActive) {
-            setActiveRunId(latestActive);
-            fetchRunResults(activeTeacher.sessionToken, latestActive);
+            setActiveCloudRunId(latestActive);
+            fetchCloudRunResults(activeTeacher.sessionToken, latestActive);
           }
           return;
         }
       } catch {
-        // Fallback cleanly to local classroom storage
+        // Fallback to local classroom storage
       }
     }
 
@@ -219,26 +282,52 @@ export function TeacherConsole() {
 
     const localQz = await offlineDb.teacherQuizzes.toArray();
     setQuizzes(localQz);
+
+    await loadLocalRuns();
   };
 
   useEffect(() => {
     loadWorkspace();
     const onSess = () => loadWorkspace();
+    const onFocus = () => {
+      if (!document.hidden) loadWorkspace();
+    };
     window.addEventListener("qg:session-updated", onSess);
-    return () => window.removeEventListener("qg:session-updated", onSess);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      stopRunScanner();
+      window.removeEventListener("qg:session-updated", onSess);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Poll live classroom roster every 5 seconds while a cloud run is active
+  // Poll cloud live roster every 5s when running
   useEffect(() => {
-    if (!activeRunId || !session?.sessionToken || session.authMode !== "supabase") return;
+    if (!activeCloudRunId || !session?.sessionToken || session.authMode !== "supabase") return;
     const token = session.sessionToken;
     const id = setInterval(() => {
-      if (navigator.onLine) fetchRunResults(token, activeRunId);
+      if (navigator.onLine) fetchCloudRunResults(token, activeCloudRunId);
     }, 5000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeRunId, session?.sessionToken, session?.authMode]);
+  }, [activeCloudRunId, session?.sessionToken, session?.authMode]);
+
+  const selectedLocalRun = localRuns.find((r) => r.id === selectedLocalRunId) || null;
+
+  // Tick local teacher run countdown timer every second while running
+  useEffect(() => {
+    if (!selectedLocalRun || selectedLocalRun.status !== "running") {
+      setLocalRunRemainingSecs(null);
+      return;
+    }
+    const tick = () => setLocalRunRemainingSecs(calculateRemainingSeconds(selectedLocalRun.endsAt, 0));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [selectedLocalRun]);
 
   const callCloudAction = async (payload: Record<string, unknown>) => {
     if (!session?.sessionToken) throw new Error("Teacher session missing.");
@@ -303,7 +392,7 @@ export function TeacherConsole() {
     setClasses((prev) => [newCls, ...prev]);
     setSelectedClassId(newCls.id);
     setNewClassName("");
-    flashMsg(true, `Created offline class "${clean}" (Code: ${joinCode}).`);
+    flashMsg(true, `Created class "${clean}" (Join Code: ${joinCode}).`);
   };
 
   const handleAddStudent = async (e: React.FormEvent) => {
@@ -338,24 +427,41 @@ export function TeacherConsole() {
 
     const sid = crypto.randomUUID();
     const qrPayload = await buildOfflineStudentIdQr(sid, stuNo.trim(), stuName.trim(), cls.joinCode);
-    const updated: LocalTeacherClass = {
-      ...cls,
-      students: [
-        ...cls.students,
-        {
-          id: sid,
-          name: stuName.trim(),
-          studentNo: stuNo.trim(),
-          qrPayload,
-          createdAt: new Date().toISOString(),
-        },
-      ],
+    const newStudent = {
+      id: sid,
+      name: stuName.trim(),
+      studentNo: stuNo.trim(),
+      qrPayload,
+      createdAt: new Date().toISOString(),
     };
+    const updated: LocalTeacherClass = { ...cls, students: [...cls.students, newStudent] };
     await offlineDb.teacherClasses.put(updated);
     setClasses((prev) => prev.map((c) => (c.id === cls.id ? updated : c)));
+
+    // Add student to active local runs for this class too
+    const classRuns = await offlineDb.teacherRuns.where("classId").equals(cls.id).toArray();
+    for (const run of classRuns) {
+      if (run.status === "running") {
+        await offlineDb.teacherRuns.put(
+          upsertStudentScoreInRun(run, {
+            studentId: sid,
+            studentName: newStudent.name,
+            studentNo: newStudent.studentNo,
+            status: "not_started",
+            answeredCount: 0,
+            score: 0,
+            maxScore: run.maxScore,
+            lateAnswers: 0,
+            verified: false,
+          })
+        );
+      }
+    }
+    await loadLocalRuns();
+
     setStuName("");
     setStuNo("");
-    flashMsg(true, "Added student QR card.");
+    flashMsg(true, `Enrolled ${newStudent.name} with printable QR card.`);
   };
 
   const handleCsvImport = async () => {
@@ -417,10 +523,7 @@ export function TeacherConsole() {
         createdAt: new Date().toISOString(),
       });
     }
-    const updated: LocalTeacherClass = {
-      ...cls,
-      students: [...cls.students, ...addedStudents],
-    };
+    const updated: LocalTeacherClass = { ...cls, students: [...cls.students, ...addedStudents] };
     await offlineDb.teacherClasses.put(updated);
     setClasses((prev) => prev.map((c) => (c.id === cls.id ? updated : c)));
     setCsvBulk("");
@@ -477,7 +580,7 @@ export function TeacherConsole() {
           questions: bp.items,
         });
         setSelectedClassId(clsData.id);
-        flashMsg(true, "Loaded demo class with 5 students, QR sheet, and Grade 10 checkpoint quiz!");
+        flashMsg(true, "Loaded demo class with 5 students, QR sheet, and Grade 10 quiz!");
         await loadWorkspace();
       } catch (err) {
         flashMsg(false, err instanceof Error ? err.message : "Demo setup failed.");
@@ -528,7 +631,7 @@ export function TeacherConsole() {
     setClasses((prev) => [demoCls, ...prev]);
     setQuizzes((prev) => [demoQuiz, ...prev]);
     setSelectedClassId(clsId);
-    flashMsg(true, "Loaded offline Demo Class (Code: DEMO10) with 5 students and Grade 10 quiz!");
+    flashMsg(true, "Loaded Demo Class (Code: DEMO10) with 5 students and Grade 10 quiz!");
   };
 
   const handleImportGrade10Quiz = async (blueprintId: string) => {
@@ -575,7 +678,7 @@ export function TeacherConsole() {
     };
     await offlineDb.teacherQuizzes.put(localQuiz);
     setQuizzes((prev) => [localQuiz, ...prev]);
-    flashMsg(true, `Added "${bp.title}" offline.`);
+    flashMsg(true, `Added "${bp.title}". Tap Quizzes → Start Run to start with your class.`);
   };
 
   const handleAddDraftQuestion = () => {
@@ -645,39 +748,19 @@ export function TeacherConsole() {
     setQuizzes((prev) => [localQz, ...prev]);
     setQuizTitle("");
     setDraftQuestions([]);
-    flashMsg(true, "Saved offline quiz cleanly.");
+    flashMsg(true, "Saved custom quiz cleanly.");
   };
 
   const handleExportEncryptedPack = async (quiz: LocalTeacherQuiz, asLink: boolean) => {
-    const encrypted = await encryptQuizPack(
-      {
-        id: quiz.id,
-        title: quiz.title,
-        subject: "Classroom Quiz",
-        description: `${quiz.questions.length} items · ${quiz.durationMinutes} mins`,
-        durationMinutes: quiz.durationMinutes,
-        instantFeedback: quiz.instantFeedback,
-        allowRetry: quiz.allowRetry,
-        createdBy: session?.name || "Teacher",
-        createdAt: new Date().toISOString(),
-        questions: toVaultQuestions(
-          quiz.questions.map((q) => ({
-            id: q.id,
-            topicCode: "CUSTOM",
-            prompt: q.prompt,
-            options: q.options,
-            correctIndex: q.correctIndex,
-            points: q.points,
-          }))
-        ),
-      },
-      exportPasscode.trim() || undefined
+    const encrypted = await buildEncryptedPackFromTeacherQuiz(
+      quiz,
+      session?.name || "Teacher",
+      exportPasscode
     );
-
     const jsonStr = JSON.stringify(encrypted, null, 2);
 
     if (asLink) {
-      const token = encodeUtf8Base64Url(JSON.stringify(encrypted));
+      const token = encodeUtf8Base64Url(jsonStr);
       const shareUrl = `${window.location.origin}/student?pack=${token}`;
       await copyText(`link-${quiz.id}`, shareUrl);
       flashMsg(
@@ -701,39 +784,270 @@ export function TeacherConsole() {
     flashMsg(true, `Downloaded encrypted "${filename}" (AES-256-GCM).`);
   };
 
-  const handleStartLiveRun = async (quizId: string) => {
+  const handleShowRunQuizQr = async (quiz: LocalTeacherQuiz) => {
+    if (runQuizQr?.title === quiz.title) {
+      setRunQuizQr(null);
+      return;
+    }
+    const encrypted = await buildEncryptedPackFromTeacherQuiz(
+      quiz,
+      session?.name || "Teacher",
+      exportPasscode
+    );
+    const compact = await encodeCompactQuizQr(encrypted);
+    if (compact.length > 2650) {
+      flashMsg(
+        false,
+        `This quiz is ${compact.length} chars (${quiz.questions.length} items) — too dense for camera QR scanning. Download .qpack.json or Copy Link instead!`
+      );
+      return;
+    }
+    setRunQuizQr({ title: quiz.title, qr: compact });
+  };
+
+  const handleStartLiveRun = async (quiz: LocalTeacherQuiz) => {
     if (isCloudSession && session?.sessionToken) {
       try {
-        const data = await callCloudAction({ action: "start_run", quizId });
+        const data = await callCloudAction({ action: "start_run", quizId: quiz.id });
         const runId = String(data.run_id);
-        setActiveRunId(runId);
-        await fetchRunResults(session.sessionToken, runId);
+        setActiveCloudRunId(runId);
+        await fetchCloudRunResults(session.sessionToken, runId);
         flashMsg(true, "Started timed live run! Students in this class can now enter.");
+        runPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
       } catch (err) {
         flashMsg(false, err instanceof Error ? err.message : "Could not start live run.");
       }
       return;
     }
+
+    // Start real Local / Offline Classroom Run persisted in IndexedDB!
+    const cls = classes.find((c) => c.id === quiz.classId) || classes.find((c) => c.id === selectedClassId);
+    const classId = cls?.id || quiz.classId || "local-default";
+    const className = cls?.name || "Classroom";
+    const joinCode = cls?.joinCode || "SELF";
+
+    // Mark any prior running local runs for this class as ended
+    const existingRuns = await offlineDb.teacherRuns.where("classId").equals(classId).toArray();
+    for (const r of existingRuns) {
+      if (r.status === "running") {
+        await offlineDb.teacherRuns.put({ ...r, status: "ended" });
+      }
+    }
+
+    const nowMs = Date.now();
+    const maxScore = quiz.questions.reduce((acc, q) => acc + (q.points || 1), 0);
+    const seedRoster = (cls?.students || []).map((st) => ({
+      studentId: st.id,
+      studentName: st.name,
+      studentNo: st.studentNo,
+      status: "not_started" as const,
+      answeredCount: 0,
+      score: 0,
+      maxScore,
+      lateAnswers: 0,
+      verified: false,
+    }));
+
+    const initialRun: LocalTeacherRun = {
+      id: `run_${quiz.id}_${nowMs}`,
+      quizId: quiz.id,
+      quizTitle: quiz.title,
+      classId,
+      className,
+      joinCode,
+      durationMinutes: quiz.durationMinutes,
+      status: "running",
+      startedAt: new Date(nowMs).toISOString(),
+      endsAt: new Date(nowMs + quiz.durationMinutes * 60 * 1000).toISOString(),
+      maxScore,
+      results: seedRoster,
+    };
+
+    const hydratedRun = await mergeLocalAttemptsIntoRun(initialRun);
+    await offlineDb.teacherRuns.put(hydratedRun);
+    await offlineDb.teacherQuizzes.put({
+      ...quiz,
+      status: "running",
+      startedAt: hydratedRun.startedAt,
+      endsAt: hydratedRun.endsAt,
+    });
+
+    // Also prepare compact Quiz QR if <= 2,650 chars so teacher can display immediately!
+    const enc = await buildEncryptedPackFromTeacherQuiz(quiz, session?.name || "Teacher", exportPasscode);
+    const compactQr = await encodeCompactQuizQr(enc);
+    setRunQuizQr(compactQr.length <= 2650 ? { title: quiz.title, qr: compactQr } : null);
+
+    await loadLocalRuns(hydratedRun.id);
+    flashMsg(true, `Quiz run started (${quiz.durationMinutes} min)! Collect offline scores via Result QR or .qres.json below.`);
+    setTimeout(() => runPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+  };
+
+  const handleEndLocalRun = async () => {
+    if (!selectedLocalRun) return;
+    const ended: LocalTeacherRun = { ...selectedLocalRun, status: "ended" };
+    await offlineDb.teacherRuns.put(ended);
+    await loadLocalRuns(ended.id);
+    await stopRunScanner();
+    flashMsg(true, `Ended "${ended.quizTitle}" (${ended.results.filter((r) => r.status === "submitted").length} student scores recorded).`);
+  };
+
+  const recordOfflineResultIntoSelectedRun = async (rawCode: string) => {
+    if (!selectedLocalRun) return;
+    const clean = rawCode.trim();
+    if (!clean) return;
+
+    const verified = await verifyOfflineOrFormatQr(clean);
+    if (!verified.valid) {
+      flashMsg(false, verified.reason || "Invalid Result QR code.");
+      return;
+    }
+
+    const stuNo = verified.studentNo || "OFFLINE";
+    const stuName = verified.studentName || "Offline Student";
+    const updatedRun = upsertStudentScoreInRun(selectedLocalRun, {
+      studentId: stuNo,
+      studentName: stuName,
+      studentNo: stuNo,
+      status: "submitted",
+      answeredCount: verified.maxScore ?? selectedLocalRun.maxScore,
+      score: verified.score ?? 0,
+      maxScore: verified.maxScore ?? selectedLocalRun.maxScore,
+      lateAnswers: verified.lateCount ?? 0,
+      verified: true,
+      verifiedVia: "offline_qr",
+      recordedAt: verified.recordedAt || new Date().toISOString(),
+    });
+
+    await offlineDb.teacherRuns.put(updatedRun);
+
+    // Also enroll student into teacherClasses if missing so roster stays accurate!
+    const cls = classes.find((c) => c.id === selectedLocalRun.classId);
+    if (cls && !cls.students.some((s) => s.studentNo.toLowerCase() === stuNo.toLowerCase())) {
+      const sid = crypto.randomUUID();
+      const stuQr = await buildOfflineStudentIdQr(sid, stuNo, stuName, cls.joinCode);
+      const nextCls = {
+        ...cls,
+        students: [
+          ...cls.students,
+          { id: sid, name: stuName, studentNo: stuNo, qrPayload: stuQr, createdAt: new Date().toISOString() },
+        ],
+      };
+      await offlineDb.teacherClasses.put(nextCls);
+      setClasses((prev) => prev.map((c) => (c.id === cls.id ? nextCls : c)));
+    }
+
+    await offlineDb.verificationLogs.add({
+      scannedAt: new Date().toISOString(),
+      studentName: stuName,
+      studentNo: stuNo,
+      scoreLabel: `${verified.score}/${verified.maxScore}`,
+      valid: true,
+      source: "qr",
+      verifiedVia: "offline",
+      rawCode: clean,
+    });
+
+    setRunResultQrInput("");
+    await loadLocalRuns(updatedRun.id);
+    flashMsg(true, `Recorded ${stuName} (${stuNo}): ${verified.score}/${verified.maxScore} [Verified ✓]`);
+  };
+
+  const handleImportRunResultFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!selectedLocalRun) return;
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    let currentRun = selectedLocalRun;
+    let importedCount = 0;
+    let failedCount = 0;
+
+    for (const file of files) {
+      try {
+        const packet = JSON.parse(await file.text()) as EncryptedResultPacket;
+        const plain = await decryptResultPacket(packet);
+        currentRun = upsertStudentScoreInRun(currentRun, {
+          studentId: plain.studentId || plain.studentNo,
+          studentName: plain.studentName,
+          studentNo: plain.studentNo,
+          status: "submitted",
+          answeredCount: plain.answers.length,
+          score: plain.score,
+          maxScore: plain.maxScore,
+          lateAnswers: plain.lateCount || 0,
+          verified: true,
+          verifiedVia: "result_file",
+          recordedAt: plain.submittedAt,
+        });
+        await offlineDb.verificationLogs.add({
+          scannedAt: new Date().toISOString(),
+          studentName: plain.studentName,
+          studentNo: plain.studentNo,
+          scoreLabel: `${plain.score}/${plain.maxScore}`,
+          valid: true,
+          source: "result_file",
+          verifiedVia: "offline",
+          rawCode: packet.sig,
+        });
+        importedCount += 1;
+      } catch {
+        failedCount += 1;
+      }
+    }
+
+    await offlineDb.teacherRuns.put(currentRun);
+    await loadLocalRuns(currentRun.id);
+    if (resultFileRef.current) resultFileRef.current.value = "";
     flashMsg(
-      true,
-      "Offline mode: Export the .qpack.json file or Copy Encrypted Link to share with students, then verify their Result QR or .qres files."
+      failedCount === 0,
+      `Imported ${importedCount} student submission file(s) into roster${failedCount > 0 ? ` (${failedCount} invalid)` : ""}.`
     );
   };
 
-  const handleEndLiveRun = async () => {
-    if (!activeRunId || !session?.sessionToken) return;
+  const startRunResultCamera = async () => {
     try {
-      await callCloudAction({ action: "end_run", runId: activeRunId });
-      await fetchRunResults(session.sessionToken, activeRunId);
-      setActiveRunId(null);
+      const { Html5Qrcode } = await import("html5-qrcode");
+      await stopRunScanner();
+      const qr = new Html5Qrcode("teacher-run-result-qr-reader");
+      runScannerRef.current = qr;
+      await qr.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 220, height: 220 } },
+        (decoded) => {
+          recordOfflineResultIntoSelectedRun(decoded);
+        },
+        () => {}
+      );
+      setRunCameraOpen(true);
+    } catch {
+      flashMsg(false, "Camera unavailable; paste the student's Result QR payload below.");
+    }
+  };
+
+  const handleEndCloudRun = async () => {
+    if (!activeCloudRunId || !session?.sessionToken) return;
+    try {
+      await callCloudAction({ action: "end_run", runId: activeCloudRunId });
+      await fetchCloudRunResults(session.sessionToken, activeCloudRunId);
+      setActiveCloudRunId(null);
       flashMsg(true, "Ended live run and finalized all in-progress attempts.");
     } catch (err) {
       flashMsg(false, err instanceof Error ? err.message : "Could not end run.");
     }
   };
 
-  const handleExportRunCsv = () => {
-    if (runResults.length === 0) return;
+  const exportCsvRows = (
+    rows: {
+      name: string;
+      studentNo: string;
+      status: string;
+      answered: number;
+      score: number;
+      maxScore: number;
+      late: number;
+      verified: boolean;
+    }[]
+  ) => {
+    if (rows.length === 0) return;
     const esc = (v: string | number | boolean) => `"${String(v).replace(/"/g, '""')}"`;
     const headers = [
       "Student Name",
@@ -745,15 +1059,15 @@ export function TeacherConsole() {
       "Late Sync Answers",
       "Verified",
     ];
-    const lines = runResults.map((r) => [
-      esc(r.student_name),
-      esc(r.student_no),
+    const lines = rows.map((r) => [
+      esc(r.name),
+      esc(r.studentNo),
       esc(r.status),
-      esc(r.answered_count),
+      esc(r.answered),
       esc(r.score),
-      esc(r.max_score),
-      esc(r.late_answers),
-      esc(r.is_verified ? "YES" : "NO"),
+      esc(r.maxScore),
+      esc(r.late),
+      esc(r.verified ? "YES" : "NO"),
     ]);
     const csv = [headers.join(","), ...lines.map((l) => l.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -777,10 +1091,12 @@ export function TeacherConsole() {
           <h1 className="text-xl font-bold">
             {session ? `Teacher Console · ${session.name}` : "Teacher Console"}
           </h1>
-          <p className="text-xs sm:text-sm text-[var(--ink-muted)]">
+          <p className="text-xs sm:text-sm text-[var(--ink-muted)] mt-0.5">
             {session?.authMode === "supabase"
-              ? "Cloud Database Connected — Classes, rosters, live runs & QRs sync via username/password."
-              : "Offline Local Mode — Create classes, print Student QRs, and export encrypted .qpack.json quizzes."}
+              ? "Cloud Sync Active — Real-time multi-device rosters, runs, and scoreboards via Supabase."
+              : serviceDbConfigured === false
+                ? "Classroom Offline Mode — Share quizzes via Quiz QR or .qpack.json and collect student scores via Result QR or .qres.json. (Optional: set SUPABASE_SERVICE_ROLE_KEY for real-time Wi-Fi DB sync)"
+                : "Offline Local Mode — Share quizzes via Quiz QR or .qpack.json and collect student scores via Result QR or .qres.json."}
           </p>
         </div>
 
@@ -792,7 +1108,7 @@ export function TeacherConsole() {
           )}
           <Link href="/verify" className="qg-btn qg-btn-secondary text-xs">
             <ScanLine className="w-4 h-4" />
-            <span>Verify Student Results</span>
+            <span>Verify Tool</span>
           </Link>
         </div>
       </div>
@@ -975,7 +1291,7 @@ export function TeacherConsole() {
                 </h3>
                 {selectedClass.students.length === 0 ? (
                   <p className="text-xs text-[var(--ink-muted)]">
-                    Add students above or share the Join Link so students register themselves.
+                    Add students above to print QR cards, share the Join Link on the same device, or collect offline student Result QRs/files directly when running a quiz.
                   </p>
                 ) : (
                   <div className="divide-y divide-[var(--border)] border border-[var(--border)] rounded-xl overflow-hidden">
@@ -1026,12 +1342,283 @@ export function TeacherConsole() {
 
       {tab === "quizzes" && (
         <div className="space-y-5">
+          {/* Active/Selected Local Offline Classroom Run Dashboard */}
+          {!isCloudSession && selectedLocalRun && (
+            <div
+              ref={runPanelRef}
+              className="qg-card p-5 space-y-4 border-l-4 border-l-[var(--primary)]"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={`text-[11px] font-bold uppercase px-2.5 py-0.5 rounded-full ${
+                        selectedLocalRun.status === "running"
+                          ? "bg-[var(--success-soft)] text-[var(--success)]"
+                          : "bg-[var(--surface-subtle)] text-[var(--ink-muted)]"
+                      }`}
+                    >
+                      {selectedLocalRun.status === "running" ? "Live Run Active" : "Run Ended"}
+                    </span>
+                    <span className="text-xs text-[var(--ink-muted)]">
+                      {selectedLocalRun.className} (Code{" "}
+                      <code className="font-mono font-bold">{selectedLocalRun.joinCode}</code>)
+                    </span>
+                  </div>
+                  <h2 className="font-bold text-lg mt-1">{selectedLocalRun.quizTitle}</h2>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {selectedLocalRun.status === "running" && localRunRemainingSecs !== null && (
+                    <span className="inline-flex items-center gap-1.5 text-sm font-mono font-bold px-3 py-1.5 rounded-full bg-[var(--primary-soft)] text-[var(--primary)] tabular-nums">
+                      <Clock className="w-4 h-4" />
+                      <span>{formatCountdown(localRunRemainingSecs)}</span>
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => loadLocalRuns(selectedLocalRun.id)}
+                    className="qg-btn qg-btn-secondary text-xs min-h-[38px]"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Refresh Scores</span>
+                  </button>
+                  {selectedLocalRun.status === "running" && (
+                    <button
+                      type="button"
+                      onClick={handleEndLocalRun}
+                      className="qg-btn qg-btn-secondary text-xs text-red-600 min-h-[38px]"
+                    >
+                      <Square className="w-3.5 h-3.5" />
+                      <span>End Run</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Run History Switcher if multiple runs exist */}
+              {localRuns.length > 1 && (
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {localRuns.map((r) => (
+                    <button
+                      key={r.id}
+                      type="button"
+                      onClick={() => setSelectedLocalRunId(r.id)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold border ${
+                        r.id === selectedLocalRun.id
+                          ? "bg-[var(--primary)] text-white border-transparent"
+                          : "bg-[var(--surface-subtle)] border-[var(--border)] text-[var(--ink-muted)]"
+                      }`}
+                    >
+                      {r.quizTitle.slice(0, 22)} ({r.status})
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Step 1: Classroom Quiz QR display if toggled or compact */}
+              {runQuizQr && (
+                <div className="p-4 rounded-xl bg-[var(--surface-subtle)] border border-[var(--border)] flex flex-col sm:flex-row items-center gap-4">
+                  <div className="w-full max-w-[240px]">
+                    <QrCanvas
+                      value={runQuizQr.qr}
+                      title="Classroom Quiz QR"
+                      subtitle="Students scan in Student Workspace → Scan Quiz QR"
+                      size={200}
+                      filename="classroom-quiz-qr.png"
+                    />
+                  </div>
+                  <div className="text-xs space-y-2 text-[var(--ink-muted)]">
+                    <p className="font-bold text-sm text-[var(--ink)]">
+                      How students load this quiz offline:
+                    </p>
+                    <p>
+                      1. Students open <b>Student Workspace → Scan Quiz QR</b> and point their phone
+                      camera at this QR code (zero internet needed).
+                    </p>
+                    <p>
+                      2. Or send them the <code>.qpack.json</code> file / Encrypted Link from below.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setRunQuizQr(null)}
+                      className="qg-btn qg-btn-secondary text-xs"
+                    >
+                      Hide Quiz QR
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Step 2: Collect Student Offline Scores Right Inside This Run */}
+              <div className="p-4 rounded-xl bg-[var(--surface-subtle)] border border-[var(--border)] space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-bold">
+                      Collect Offline Student Scores (
+                      {selectedLocalRun.results.filter((r) => r.status === "submitted").length}/
+                      {selectedLocalRun.results.length} Recorded)
+                    </h3>
+                    <p className="text-xs text-[var(--ink-muted)]">
+                      Scan each student&apos;s Result QR (<code>QG1O.*</code>) or import their{" "}
+                      <code>.qres.json</code> files to update scores below.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => (runCameraOpen ? stopRunScanner() : startRunResultCamera())}
+                      className="qg-btn qg-btn-primary text-xs min-h-[38px]"
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>{runCameraOpen ? "Stop Camera" : "Scan Result QR"}</span>
+                    </button>
+                    <input
+                      ref={resultFileRef}
+                      type="file"
+                      accept=".json,.qres.json"
+                      multiple
+                      className="hidden"
+                      onChange={handleImportRunResultFiles}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => resultFileRef.current?.click()}
+                      className="qg-btn qg-btn-secondary text-xs min-h-[38px]"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Import .qres.json File(s)</span>
+                    </button>
+                  </div>
+                </div>
+
+                {runCameraOpen && (
+                  <div className="w-full max-w-[240px] aspect-square mx-auto rounded-xl overflow-hidden bg-slate-900 border border-[var(--border)]">
+                    <div id="teacher-run-result-qr-reader" className="w-full h-full" />
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <input
+                    className="qg-input text-xs font-mono"
+                    placeholder="Or paste Student Result QR code (QG1O....) to record score"
+                    value={runResultQrInput}
+                    onChange={(e) => setRunResultQrInput(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    disabled={!runResultQrInput.trim()}
+                    onClick={() => recordOfflineResultIntoSelectedRun(runResultQrInput)}
+                    className="qg-btn qg-btn-secondary text-xs shrink-0"
+                  >
+                    Record Score
+                  </button>
+                </div>
+              </div>
+
+              {/* Step 3: Live Roster & Export Table */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-bold">Class Run Roster &amp; Scores</h3>
+                  {selectedLocalRun.results.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        exportCsvRows(
+                          selectedLocalRun.results.map((r) => ({
+                            name: r.studentName,
+                            studentNo: r.studentNo,
+                            status: r.status,
+                            answered: r.answeredCount,
+                            score: r.score,
+                            maxScore: r.maxScore,
+                            late: r.lateAnswers,
+                            verified: r.verified,
+                          }))
+                        )
+                      }
+                      className="qg-btn qg-btn-secondary text-xs min-h-[34px]"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Export Class CSV</span>
+                    </button>
+                  )}
+                </div>
+
+                {selectedLocalRun.results.length === 0 ? (
+                  <p className="text-xs text-[var(--ink-muted)] p-3 rounded-xl bg-[var(--surface-subtle)]">
+                    No students recorded yet. Enroll students in your class, or scan their Result QR
+                    / import <code>.qres.json</code> files above as students finish!
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto border border-[var(--border)] rounded-xl">
+                    <table className="w-full text-xs text-left">
+                      <thead className="bg-[var(--surface-subtle)]">
+                        <tr className="border-b border-[var(--border)]">
+                          <th className="py-2 px-3">Student</th>
+                          <th className="py-2 px-3">Student No</th>
+                          <th className="py-2 px-3">Status</th>
+                          <th className="py-2 px-3">Score</th>
+                          <th className="py-2 px-3">Verification</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {selectedLocalRun.results.map((r) => (
+                          <tr key={`${r.studentNo}-${r.studentId}`} className="border-b border-[var(--border)]">
+                            <td className="py-2 px-3 font-semibold">{r.studentName}</td>
+                            <td className="py-2 px-3 font-mono">{r.studentNo}</td>
+                            <td className="py-2 px-3">
+                              <span
+                                className={`inline-block px-2 py-0.5 rounded-full font-semibold ${
+                                  r.status === "submitted"
+                                    ? "bg-[var(--success-soft)] text-[var(--success)]"
+                                    : r.status === "in_progress"
+                                      ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                                      : "bg-[var(--surface-subtle)] text-[var(--ink-muted)]"
+                                }`}
+                              >
+                                {r.status === "submitted"
+                                  ? "Scored"
+                                  : r.status === "in_progress"
+                                    ? `Answering (${r.answeredCount})`
+                                    : "Waiting"}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 font-bold tabular-nums">
+                              {r.score}/{r.maxScore}
+                            </td>
+                            <td className="py-2 px-3">
+                              {r.verified ? (
+                                <span className="inline-flex items-center gap-1 text-[var(--success)] font-semibold">
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                  <span>
+                                    {r.verifiedVia === "offline_qr"
+                                      ? "Result QR"
+                                      : r.verifiedVia === "result_file"
+                                        ? ".qres File"
+                                        : "Device Sync"}
+                                  </span>
+                                </span>
+                              ) : (
+                                <span className="text-[var(--ink-muted)]">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Quick-Import Grade 10 Hardcoded Bank */}
           <div className="qg-card p-5 space-y-3">
             <h2 className="font-bold text-base">Load Hardcoded Grade 10 Math Assessments</h2>
             <p className="text-xs text-[var(--ink-muted)]">
               Add built-in Grade 10 Quarter 2 assessments to export as AES-256-GCM encrypted files or
-              run live with your class.
+              run with your class.
             </p>
             <div className="flex flex-wrap gap-2">
               {GRADE10_BLUEPRINTS.map((bp) => (
@@ -1149,13 +1736,14 @@ export function TeacherConsole() {
             </button>
           </form>
 
-          {/* Saved Quizzes & Export Controls */}
+          {/* Saved Quizzes & Run Controls */}
           <div className="qg-card p-5 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h2 className="font-bold text-base">Your Quizzes</h2>
                 <p className="text-xs text-[var(--ink-muted)]">
-                  Download encrypted <code>.qpack.json</code> files or copy encrypted quiz links.
+                  Click <b>Start Run</b> to open the classroom timer &amp; score roster, show Quiz
+                  QR, or export <code>.qpack.json</code>.
                 </p>
               </div>
               <input
@@ -1189,6 +1777,14 @@ export function TeacherConsole() {
                     <div className="flex flex-wrap gap-2">
                       <button
                         type="button"
+                        onClick={() => handleShowRunQuizQr(qz)}
+                        className="qg-btn qg-btn-secondary text-xs min-h-[38px]"
+                      >
+                        <QrCode className="w-3.5 h-3.5" />
+                        <span>Quiz QR</span>
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => handleExportEncryptedPack(qz, false)}
                         className="qg-btn qg-btn-secondary text-xs min-h-[38px]"
                       >
@@ -1205,11 +1801,11 @@ export function TeacherConsole() {
                         ) : (
                           <Link2 className="w-3.5 h-3.5" />
                         )}
-                        <span>Copy Encrypted Link</span>
+                        <span>Copy Link</span>
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleStartLiveRun(qz.id)}
+                        onClick={() => handleStartLiveRun(qz)}
                         className="qg-btn qg-btn-primary text-xs min-h-[38px]"
                       >
                         <Play className="w-3.5 h-3.5" />
@@ -1221,18 +1817,19 @@ export function TeacherConsole() {
               </div>
             )}
 
-            {runResults.length > 0 && (
-              <div className="p-4 rounded-xl border border-blue-500/40 bg-[var(--primary-soft)] space-y-3">
+            {/* Cloud Live Run Roster */}
+            {cloudRunResults.length > 0 && (
+              <div ref={runPanelRef} className="p-4 rounded-xl border border-blue-500/40 bg-[var(--primary-soft)] space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="font-bold text-sm">
-                    Live Run Roster ({runResults.length} Students)
+                    Cloud Live Run Roster ({cloudRunResults.length} Students)
                   </h3>
                   <div className="flex flex-wrap gap-2">
-                    {activeRunId && session?.sessionToken && (
+                    {activeCloudRunId && session?.sessionToken && (
                       <button
                         type="button"
                         onClick={() =>
-                          session.sessionToken && fetchRunResults(session.sessionToken, activeRunId)
+                          session.sessionToken && fetchCloudRunResults(session.sessionToken, activeCloudRunId)
                         }
                         className="qg-btn qg-btn-secondary text-xs min-h-[34px]"
                       >
@@ -1244,16 +1841,29 @@ export function TeacherConsole() {
                     )}
                     <button
                       type="button"
-                      onClick={handleExportRunCsv}
+                      onClick={() =>
+                        exportCsvRows(
+                          cloudRunResults.map((r) => ({
+                            name: r.student_name,
+                            studentNo: r.student_no,
+                            status: r.status,
+                            answered: r.answered_count,
+                            score: r.score,
+                            maxScore: r.max_score,
+                            late: r.late_answers,
+                            verified: r.is_verified,
+                          }))
+                        )
+                      }
                       className="qg-btn qg-btn-secondary text-xs min-h-[34px]"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Export CSV</span>
                     </button>
-                    {activeRunId && (
+                    {activeCloudRunId && (
                       <button
                         type="button"
-                        onClick={handleEndLiveRun}
+                        onClick={handleEndCloudRun}
                         className="qg-btn qg-btn-secondary text-xs text-red-600 min-h-[34px]"
                       >
                         <Square className="w-3.5 h-3.5" />
@@ -1273,7 +1883,7 @@ export function TeacherConsole() {
                       </tr>
                     </thead>
                     <tbody>
-                      {runResults.map((r) => (
+                      {cloudRunResults.map((r) => (
                         <tr key={r.student_id} className="border-b border-[var(--border)]">
                           <td className="py-1.5 pr-3 font-semibold">{r.student_name}</td>
                           <td className="py-1.5 pr-3">{r.status}</td>
@@ -1300,7 +1910,7 @@ export function TeacherConsole() {
                 Printable QR Sheet · {selectedClass?.name || "Select a class"}
               </h2>
               <p className="text-xs text-[var(--ink-muted)]">
-                Cut and hand one personal login QR card to each student.
+                Post the Class Self-Register QR on the board or print individual Student ID QR cards.
               </p>
             </div>
             <button
@@ -1313,9 +1923,25 @@ export function TeacherConsole() {
             </button>
           </div>
 
+          {selectedClass && (
+            <div className="max-w-xs qr-sheet-card">
+              <QrCanvas
+                value={
+                  typeof window !== "undefined"
+                    ? `${window.location.origin}/auth?role=student&tab=register&join=${selectedClass.joinCode}`
+                    : selectedClass.joinCode
+                }
+                title={`Class Join Pass: ${selectedClass.name}`}
+                subtitle={`Code: ${selectedClass.joinCode} · Scan to register`}
+                size={160}
+                filename={`join-class-${selectedClass.joinCode}.png`}
+              />
+            </div>
+          )}
+
           {!selectedClass || selectedClass.students.length === 0 ? (
             <div className="qg-card p-6 text-sm text-[var(--ink-muted)]">
-              Add students to a class first to generate printable QR cards.
+              Add students to a class first to generate individual printable Student ID QR cards.
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">

@@ -7,9 +7,9 @@ import {
   ArrowRight,
   Award,
   BookOpen,
+  Camera,
   CheckCircle2,
   ClipboardList,
-  Download,
   FileKey2,
   Lock,
   Play,
@@ -19,9 +19,9 @@ import {
   Upload,
 } from "lucide-react";
 import {
-  decodeUtf8Base64Url,
   decryptQuizPack,
   encryptResultPacket,
+  importAnyQuizInput,
   type EncryptedQuizPack,
 } from "@/lib/crypto/quizVault";
 import {
@@ -34,9 +34,11 @@ import {
   type ActiveSession,
   type ImportedPackRecord,
   type LocalAttemptRecord,
+  type LocalTeacherRun,
   type StudyProgressRecord,
 } from "@/lib/offline/storage";
 import { flushStudentSyncQueue } from "@/lib/offline/syncEngine";
+import { ensureLocalTeacherQuizImported } from "@/lib/offline/runRosterSync";
 import { Grade10ModuleDrawer } from "./Grade10ModuleDrawer";
 import { QrCanvas } from "./QrCanvas";
 
@@ -83,6 +85,7 @@ export function StudentWorkspace() {
   const [activeWeekIdx, setActiveWeekIdx] = useState<number | null>(null);
 
   const [remoteState, setRemoteState] = useState<RemoteRunInfo | null>(null);
+  const [activeLocalRun, setActiveLocalRun] = useState<LocalTeacherRun | null>(null);
   const [remoteError, setRemoteError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
 
@@ -91,12 +94,90 @@ export function StudentWorkspace() {
   const [packPin, setPackPin] = useState("");
   const [selectedAttemptQr, setSelectedAttemptQr] = useState<LocalAttemptRecord | null>(null);
 
+  // Scan Quiz QR state (zero-internet teacher-to-student distribution)
+  const [showQrImport, setShowQrImport] = useState(false);
+  const [qrPackInput, setQrPackInput] = useState("");
+  const [cameraActive, setCameraActive] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const scannerRef = useRef<{ stop: () => Promise<void>; clear: () => void } | null>(null);
+
+  const stopCamera = async () => {
+    if (scannerRef.current) {
+      try {
+        await scannerRef.current.stop();
+        scannerRef.current.clear();
+      } catch {
+        // Ignore cleanup failure
+      }
+      scannerRef.current = null;
+      setCameraActive(false);
+    }
+  };
+
+  const handleImportRawQuiz = async (raw: string, source: "qr" | "link" | "file") => {
+    setImportMsg(null);
+    const parsed = await importAnyQuizInput(raw);
+    if (parsed.lockedWithPasscode) {
+      setLockedPack(parsed);
+      setShowQrImport(false);
+      await stopCamera();
+      return;
+    }
+    await decryptQuizPack(parsed);
+    await offlineDb.importedPacks.put({
+      id: parsed.id,
+      pack: parsed,
+      importedAt: new Date().toISOString(),
+      source,
+    });
+    setImportMsg({
+      ok: true,
+      text: `Loaded "${parsed.title}" (${parsed.questionCount} questions) offline! Tap Start Quiz below.`,
+    });
+    setQrPackInput("");
+    setShowQrImport(false);
+    await stopCamera();
+    loadLocalWorkspace();
+  };
+
+  const startQuizQrScanner = async () => {
+    setImportMsg(null);
+    try {
+      const { Html5Qrcode } = await import("html5-qrcode");
+      await stopCamera();
+      const qr = new Html5Qrcode("student-quiz-qr-reader");
+      scannerRef.current = qr;
+      await qr.start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        async (decoded) => {
+          try {
+            await handleImportRawQuiz(decoded, "qr");
+          } catch (err) {
+            setImportMsg({
+              ok: false,
+              text: err instanceof Error ? err.message : "Could not read scanned Quiz QR.",
+            });
+          }
+        },
+        () => {}
+      );
+      setCameraActive(true);
+    } catch {
+      setImportMsg({
+        ok: false,
+        text: "Camera unavailable. Paste the Quiz QR code (`QPK1...`) or encrypted link below.",
+      });
+      setCameraActive(false);
+    }
+  };
 
   const loadLocalWorkspace = async () => {
     if (!offlineDb) return;
     const sess = (await offlineDb.session.get("active")) || null;
-    setSession(sess?.role === "student" ? sess : null);
+    const studentSess = sess?.role === "student" ? sess : null;
+    setSession(studentSess);
 
     // Ensure built-in hardcoded Grade 10 encrypted packs exist cleanly in IndexedDB
     const existing = await offlineDb.importedPacks.toArray();
@@ -112,28 +193,42 @@ export function StudentWorkspace() {
       }
     }
 
+    // Check if there is an active local classroom run matching this student's class
+    const allRuns = await offlineDb.teacherRuns.toArray();
+    const matchingRun =
+      allRuns.find(
+        (r) =>
+          r.status === "running" &&
+          studentSess &&
+          ((studentSess.classId && r.classId === studentSess.classId) ||
+            (studentSess.classCode &&
+              r.joinCode.toUpperCase() === studentSess.classCode.toUpperCase()))
+      ) || null;
+    setActiveLocalRun(matchingRun);
+    if (matchingRun) {
+      await ensureLocalTeacherQuizImported(matchingRun.quizId);
+    }
+
     // Import encrypted pack if opened via ?pack=<token> teacher link
     if (typeof window !== "undefined") {
       const packToken = new URLSearchParams(window.location.search).get("pack");
       if (packToken) {
         try {
-          const decoded = JSON.parse(decodeUtf8Base64Url(packToken)) as EncryptedQuizPack;
-          if (decoded.kind === "QGATE_PACK") {
-            if (decoded.lockedWithPasscode) {
-              setLockedPack(decoded);
-            } else {
-              await decryptQuizPack(decoded);
-              await offlineDb.importedPacks.put({
-                id: decoded.id,
-                pack: decoded,
-                importedAt: new Date().toISOString(),
-                source: "link",
-              });
-              setImportMsg({
-                ok: true,
-                text: `Imported shared quiz "${decoded.title}" (${decoded.questionCount} questions).`,
-              });
-            }
+          const parsed = await importAnyQuizInput(window.location.href);
+          if (parsed.lockedWithPasscode) {
+            setLockedPack(parsed);
+          } else {
+            await decryptQuizPack(parsed);
+            await offlineDb.importedPacks.put({
+              id: parsed.id,
+              pack: parsed,
+              importedAt: new Date().toISOString(),
+              source: "link",
+            });
+            setImportMsg({
+              ok: true,
+              text: `Imported shared quiz "${parsed.title}" (${parsed.questionCount} questions).`,
+            });
           }
         } catch {
           setImportMsg({ ok: false, text: "Invalid or corrupted quiz link." });
@@ -151,14 +246,12 @@ export function StudentWorkspace() {
     const prog = await offlineDb.studyProgress.get("current");
     if (prog) setStudyProgress(prog);
 
-    // Check if Supabase live classroom run exists
     if (
-      sess?.role === "student" &&
-      sess.authMode === "supabase" &&
-      sess.sessionToken &&
+      studentSess?.authMode === "supabase" &&
+      studentSess.sessionToken &&
       navigator.onLine
     ) {
-      refreshRemoteState(sess.sessionToken);
+      refreshRemoteState(studentSess.sessionToken);
     }
   };
 
@@ -221,6 +314,7 @@ export function StudentWorkspace() {
     window.addEventListener("focus", onReconnect);
     document.addEventListener("visibilitychange", onReconnect);
     return () => {
+      stopCamera();
       window.removeEventListener("qg:session-updated", onSessChange);
       window.removeEventListener("online", onReconnect);
       window.removeEventListener("focus", onReconnect);
@@ -252,26 +346,7 @@ export function StudentWorkspace() {
     const reader = new FileReader();
     reader.onload = async (ev) => {
       try {
-        const parsed = JSON.parse(String(ev.target?.result)) as EncryptedQuizPack;
-        if (parsed.kind !== "QGATE_PACK") {
-          throw new Error("Invalid file. Expected an encrypted .qpack.json quiz file.");
-        }
-        if (parsed.lockedWithPasscode) {
-          setLockedPack(parsed);
-          return;
-        }
-        await decryptQuizPack(parsed);
-        await offlineDb.importedPacks.put({
-          id: parsed.id,
-          pack: parsed,
-          importedAt: new Date().toISOString(),
-          source: "file",
-        });
-        setImportMsg({
-          ok: true,
-          text: `Added "${parsed.title}" (${parsed.questionCount} questions) for offline access.`,
-        });
-        loadLocalWorkspace();
+        await handleImportRawQuiz(String(ev.target?.result), "file");
       } catch (err) {
         setImportMsg({
           ok: false,
@@ -442,12 +517,47 @@ export function StudentWorkspace() {
 
       {tab === "quizzes" && (
         <div className="space-y-4">
+          {/* Active Local Teacher Run Card (same-device / classroom offline link) */}
+          {activeLocalRun && (
+            <div className="qg-card p-5 space-y-3 border-l-4 border-l-emerald-500">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+                  Teacher Started Classroom Quiz · {activeLocalRun.className}
+                </span>
+                <span className="text-xs font-mono font-bold text-[var(--ink-muted)]">
+                  Code {activeLocalRun.joinCode}
+                </span>
+              </div>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="font-bold text-base">{activeLocalRun.quizTitle}</h3>
+                  <p className="text-xs text-[var(--ink-muted)]">
+                    {activeLocalRun.durationMinutes} min timer · Show Result QR to teacher after finishing
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sessionStorage.setItem("qg_active_play_id", activeLocalRun.quizId);
+                    router.push(
+                      `/student/play?id=${encodeURIComponent(activeLocalRun.quizId)}#${encodeURIComponent(activeLocalRun.quizId)}`
+                    );
+                  }}
+                  className="qg-btn qg-btn-primary text-sm shrink-0"
+                >
+                  <Play className="w-4 h-4" />
+                  <span>Start Classroom Quiz</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Live Cloud Classroom Run Card */}
           {session?.authMode === "supabase" && (
             <div className="qg-card p-5 space-y-3 border-l-4 border-l-[var(--primary)]">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-bold uppercase tracking-wide text-[var(--primary)]">
-                  Live Classroom Quiz
+                  Live Cloud Classroom Quiz
                 </span>
                 <button
                   type="button"
@@ -492,41 +602,100 @@ export function StudentWorkspace() {
                 </div>
               ) : (
                 <p className="text-sm text-[var(--ink-muted)]">
-                  No quiz is currently active in your class. Wait for your teacher to start one,
-                  or take an offline encrypted quiz pack below.
+                  Waiting for your teacher to start a quiz, or scan a Quiz QR / import an offline pack below.
                 </p>
               )}
             </div>
           )}
 
-          {/* Import Teacher Offline File Bar */}
-          <div className="qg-card p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <FileKey2 className="w-5 h-5 text-[var(--primary)] shrink-0" />
-              <div>
-                <h2 className="text-sm font-bold">Encrypted Quiz Packs (Offline Ready)</h2>
-                <p className="text-xs text-[var(--ink-muted)]">
-                  Questions stay AES-256-GCM encrypted until started; answers save offline to IndexedDB.
-                </p>
+          {/* Import / Scan Teacher Quiz Bar */}
+          <div className="qg-card p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <FileKey2 className="w-5 h-5 text-[var(--primary)] shrink-0" />
+                <div>
+                  <h2 className="text-sm font-bold">Load Teacher Quiz Offline</h2>
+                  <p className="text-xs text-[var(--ink-muted)]">
+                    Scan teacher&apos;s Classroom Quiz QR with your camera or import a <code>.qpack.json</code> file.
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (showQrImport) {
+                      stopCamera();
+                      setShowQrImport(false);
+                    } else {
+                      setShowQrImport(true);
+                    }
+                  }}
+                  className="qg-btn qg-btn-primary text-xs"
+                >
+                  <QrCode className="w-4 h-4" />
+                  <span>{showQrImport ? "Close Scanner" : "Scan Quiz QR"}</span>
+                </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".json,.qpack.json"
+                  className="hidden"
+                  onChange={handleImportPackFile}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="qg-btn qg-btn-secondary text-xs"
+                >
+                  <Upload className="w-4 h-4" />
+                  <span>Import .qpack.json</span>
+                </button>
               </div>
             </div>
-            <div>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".json,.qpack.json"
-                className="hidden"
-                onChange={handleImportPackFile}
-              />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="qg-btn qg-btn-secondary text-xs w-full sm:w-auto"
-              >
-                <Upload className="w-4 h-4" />
-                <span>Import .qpack.json</span>
-              </button>
-            </div>
+
+            {showQrImport && (
+              <div className="pt-3 border-t border-[var(--border)] space-y-3">
+                <div className="w-full max-w-[260px] aspect-square mx-auto rounded-2xl overflow-hidden bg-slate-900 relative border border-[var(--border)]">
+                  <div id="student-quiz-qr-reader" className="w-full h-full" />
+                  {!cameraActive && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center p-4 bg-slate-900 text-white text-center">
+                      <Camera className="w-9 h-9 text-slate-400 mb-2" />
+                      <button
+                        type="button"
+                        onClick={startQuizQrScanner}
+                        className="qg-btn qg-btn-primary text-xs"
+                      >
+                        Start Camera
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    className="qg-input text-xs font-mono"
+                    placeholder="Or paste Quiz QR payload (QPK1...) or quiz link"
+                    value={qrPackInput}
+                    onChange={(e) => setQrPackInput(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    disabled={!qrPackInput.trim()}
+                    onClick={() =>
+                      handleImportRawQuiz(qrPackInput, "qr").catch((err) =>
+                        setImportMsg({
+                          ok: false,
+                          text: err instanceof Error ? err.message : "Invalid Quiz QR payload.",
+                        })
+                      )
+                    }
+                    className="qg-btn qg-btn-primary text-xs shrink-0"
+                  >
+                    Load
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {lockedPack && (

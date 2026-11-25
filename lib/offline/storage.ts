@@ -9,7 +9,7 @@ export interface LocalAccount {
   id: string;
   role: "student" | "teacher";
   name: string;
-  identifier: string; // student_no or email/username
+  identifier: string; // student_no or teacher username
   pinHash: string;
   classCode?: string;
   className?: string;
@@ -28,14 +28,14 @@ export interface ActiveSession {
   className?: string;
   qrPayload?: string;
   authMode: "supabase" | "offline";
-  sessionToken?: string; // student server token or supabase JWT
+  sessionToken?: string;
 }
 
 export interface ImportedPackRecord {
   id: string;
   pack: EncryptedQuizPack;
   importedAt: string;
-  source: "file" | "link" | "builtin";
+  source: "file" | "link" | "builtin" | "qr";
 }
 
 export interface QueuedAnswerRecord {
@@ -111,6 +111,35 @@ export interface LocalTeacherQuiz {
   createdAt: string;
 }
 
+export interface LocalRunStudentScore {
+  studentId: string;
+  studentName: string;
+  studentNo: string;
+  status: "not_started" | "in_progress" | "submitted";
+  answeredCount: number;
+  score: number;
+  maxScore: number;
+  lateAnswers: number;
+  verified: boolean;
+  verifiedVia?: "offline_qr" | "result_file" | "local_device" | "supabase";
+  recordedAt?: string;
+}
+
+export interface LocalTeacherRun {
+  id: string;
+  quizId: string;
+  quizTitle: string;
+  classId: string;
+  className: string;
+  joinCode: string;
+  durationMinutes: number;
+  status: "running" | "ended";
+  startedAt: string;
+  endsAt: string;
+  maxScore: number;
+  results: LocalRunStudentScore[];
+}
+
 export interface TeacherVerificationEntry {
   id?: number;
   scannedAt: string;
@@ -132,6 +161,7 @@ export class QuizGateOfflineDB extends Dexie {
   studyProgress!: EntityTable<StudyProgressRecord, "key">;
   teacherClasses!: EntityTable<LocalTeacherClass, "id">;
   teacherQuizzes!: EntityTable<LocalTeacherQuiz, "id">;
+  teacherRuns!: EntityTable<LocalTeacherRun, "id">;
   verificationLogs!: EntityTable<TeacherVerificationEntry, "id">;
 
   constructor() {
@@ -145,6 +175,18 @@ export class QuizGateOfflineDB extends Dexie {
       studyProgress: "key",
       teacherClasses: "id, joinCode",
       teacherQuizzes: "id, classId, status",
+      verificationLogs: "++id, scannedAt, studentName, valid",
+    });
+    this.version(2).stores({
+      accounts: "id, role, identifier, classCode",
+      session: "key",
+      importedPacks: "id, importedAt",
+      answerQueue: "++id, attemptId, packOrRunId, questionId, syncStatus",
+      attempts: "id, packOrRunId, studentId, status, syncStatus",
+      studyProgress: "key",
+      teacherClasses: "id, joinCode",
+      teacherQuizzes: "id, classId, status",
+      teacherRuns: "id, quizId, classId, status, startedAt",
       verificationLogs: "++id, scannedAt, studentName, valid",
     });
   }
