@@ -26,7 +26,8 @@ function AuthScreenInner() {
   const router = useRouter();
   const params = useSearchParams();
 
-  const initialRole = params.get("role") === "teacher" ? "teacher" : "student";
+  const explicitStudentRole = params.get("role") === "student";
+  const initialRole: RoleMode = explicitStudentRole ? "student" : "teacher";
   const paramTab = params.get("tab");
   const initialTab: AuthTab =
     paramTab === "register" ? "register" : paramTab === "qr" ? "qr" : "login";
@@ -309,22 +310,24 @@ function AuthScreenInner() {
         });
         if (res.ok) {
           const data = await res.json();
-          await offlineDb.session.put({
-            key: "active",
-            role: "student",
-            userId: data.student.id,
-            name: data.student.name,
-            identifier: data.student.student_no,
-            classId: data.student.class_id,
-            classCode: cleanCode,
-            className: data.student.class_name,
-            qrPayload: localAcc?.qrPayload,
-            authMode: "supabase",
-            sessionToken: data.session_token,
-          });
-          window.dispatchEvent(new CustomEvent("qg:session-updated"));
-          router.push("/student");
-          return;
+          if (data.mode === "supabase" && data.student) {
+            await offlineDb.session.put({
+              key: "active",
+              role: "student",
+              userId: data.student.id,
+              name: data.student.name,
+              identifier: data.student.student_no,
+              classId: data.student.class_id,
+              classCode: cleanCode,
+              className: data.student.class_name,
+              qrPayload: localAcc?.qrPayload,
+              authMode: "supabase",
+              sessionToken: data.session_token,
+            });
+            window.dispatchEvent(new CustomEvent("qg:session-updated"));
+            router.push("/student");
+            return;
+          }
         }
         // If remote login rejected (401), fail unless offline local matches explicitly
         if (res.status === 401 && !localAcc) {
@@ -485,8 +488,8 @@ function AuthScreenInner() {
           return;
         }
 
-        // Reject actual invalid credentials/duplicate username rather than silently masking with offline mode
-        if (res.status !== 503) {
+        // Reject actual invalid credentials/duplicate username; fall through cleanly on offline/local mode
+        if (!(res.ok && data.mode === "offline") && res.status !== 503) {
           throw new Error(data.error || "Teacher authentication failed.");
         }
       }
@@ -587,33 +590,42 @@ function AuthScreenInner() {
 
   return (
     <div className="max-w-md mx-auto space-y-4">
-      {/* Role Selector */}
-      <div className="grid grid-cols-2 gap-2 p-1.5 qg-card">
-        <button
-          type="button"
-          onClick={() => setRole("student")}
-          className={`qg-btn text-sm ${
-            role === "student" ? "qg-btn-primary" : "bg-transparent text-[var(--ink-muted)]"
-          }`}
-        >
-          <User className="w-4 h-4" />
-          <span>Student</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            stopCamera();
-            setRole("teacher");
-            if (tab === "qr") setTab("login");
-          }}
-          className={`qg-btn text-sm ${
-            role === "teacher" ? "qg-btn-primary" : "bg-transparent text-[var(--ink-muted)]"
-          }`}
-        >
-          <GraduationCap className="w-4 h-4" />
-          <span>Teacher</span>
-        </button>
+      <div className="qg-card p-3.5 text-xs text-[var(--ink-muted)] flex items-center justify-between gap-2">
+        <span>
+          <strong className="text-[var(--ink)]">Teacher Sign In</strong> · Students do not need an
+          account — open your teacher&apos;s Quiz Link directly.
+        </span>
       </div>
+
+      {/* Legacy Student Role Selector only if explicitly requested via ?role=student */}
+      {explicitStudentRole && (
+        <div className="grid grid-cols-2 gap-2 p-1.5 qg-card">
+          <button
+            type="button"
+            onClick={() => setRole("student")}
+            className={`qg-btn text-sm ${
+              role === "student" ? "qg-btn-primary" : "bg-transparent text-[var(--ink-muted)]"
+            }`}
+          >
+            <User className="w-4 h-4" />
+            <span>Student</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              stopCamera();
+              setRole("teacher");
+              if (tab === "qr") setTab("login");
+            }}
+            className={`qg-btn text-sm ${
+              role === "teacher" ? "qg-btn-primary" : "bg-transparent text-[var(--ink-muted)]"
+            }`}
+          >
+            <GraduationCap className="w-4 h-4" />
+            <span>Teacher</span>
+          </button>
+        </div>
+      )}
 
       {/* Mode Card */}
       <div className="qg-card p-5 space-y-5">

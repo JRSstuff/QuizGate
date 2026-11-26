@@ -1,253 +1,189 @@
 import { test, expect } from "@playwright/test";
+import fs from "node:fs";
 
-test.describe("QuizGate PWA: Registration, Study Scenario Fix, Encrypted Offline Quiz, Demo Flow & QR Verification", () => {
-  test("registers student, verifies Grade 10 scenario questions grade accurately, takes encrypted quiz offline, reloads offline, and verifies QR", async ({
-    page,
-    context,
-  }) => {
-    // 1. Load Home online so PWA Service Worker installs & warms all routes
-    await page.goto("/");
-    await expect(page.locator("h1")).toContainText("Student Portal");
+test.describe("QuizGate PWA: Link-Based Offline Quiz Flow & Study Verification", () => {
+  test("teacher creates quiz link -> 2 students go offline -> waiting room hides questions -> Start Code unlocks -> auto-submit timer -> teacher uploads both .qres.json offline -> CSV", async ({
+    browser,
+    context: teacherContext,
+    page: teacherPage,
+  }, testInfo) => {
+    test.setTimeout(90000);
 
-    await page.evaluate(async () => {
-      if ("serviceWorker" in navigator) {
-        await navigator.serviceWorker.ready;
-      }
+    // 1. Verify UI hides student Login/Register on HomeScreen and shows Classroom Offline Mode badge cleanly
+    await teacherPage.goto("/");
+    await expect(
+      teacherPage.getByText("Student Quiz Portal").or(teacherPage.getByText("Student Portal"))
+    ).toBeVisible();
+    await expect(teacherPage.locator('a[href*="role=student"]')).toHaveCount(0);
+    await expect(teacherPage.getByRole("link", { name: /^Register$/i })).toHaveCount(0);
+
+    // 2. Teacher opens /teacher and creates a 15-second (0.25 min) Quiz Link
+    await teacherPage.goto("/teacher");
+    await expect(teacherPage.getByText(/Classroom Offline Mode —/i)).toBeVisible();
+
+    await teacherPage.fill("#link-quiz-title", "Circles E2E Offline Test");
+    await teacherPage.fill("#link-class-name", "Grade 10 - Rizal");
+    await teacherPage.fill("#link-sections", "10-Rizal, 10-Bonifacio");
+    await teacherPage.fill("#link-duration-mins", "0.25");
+
+    await teacherPage.getByTestId("create-quiz-link-btn").click();
+    const linkInput = teacherPage.getByTestId("generated-quiz-link");
+    await expect(linkInput).toBeVisible();
+    const shareUrl = await linkInput.inputValue();
+    expect(shareUrl).toContain("/q/");
+    expect(shareUrl).toContain("#L3.");
+
+    // 3. Launch TWO isolated student mobile contexts opening the shareable link
+    const student1Ctx = await browser.newContext({
+      viewport: { width: 393, height: 851 },
+      acceptDownloads: true,
     });
-    await page.waitForTimeout(900);
+    const student2Ctx = await browser.newContext({
+      viewport: { width: 393, height: 851 },
+      acceptDownloads: true,
+    });
 
-    // 2. Register Student Account -> get Personal Identity QR
-    await page.locator("a:has-text('Register')").first().click();
-    await page.waitForURL("**/auth**");
+    const s1Page = await student1Ctx.newPage();
+    const s2Page = await student2Ctx.newPage();
 
-    await page.locator("input[placeholder*='Dela Cruz']").fill("Luna, Antonio M.");
-    await page.locator("input[placeholder='2026-0001']").fill("2026-0199");
-    await page.locator("input[placeholder='Enter PIN or password']").fill("123456");
-    await page.locator("button:has-text('Create Student Account & QR Pass')").click();
+    await Promise.all([s1Page.goto(shareUrl), s2Page.goto(shareUrl)]);
 
-    await expect(page.locator("h1")).toContainText("Registration Complete");
-    await expect(page.locator("canvas[aria-label='Luna, Antonio M.']")).toBeVisible();
+    // Wait until both students show Ready Offline (bundle in IndexedDB + SW route/assets cached)
+    await expect(s1Page.getByTestId("ready-offline-badge")).toBeVisible({ timeout: 15000 });
+    await expect(s2Page.getByTestId("ready-offline-badge")).toBeVisible({ timeout: 15000 });
 
-    await page.locator("button:has-text('Continue to Student Workspace')").click();
-    await page.waitForURL("**/student");
-    await expect(page.locator("h1")).toContainText("Hi, Luna, Antonio M.");
+    await s1Page.fill("#student-full-name", "Maria Santos");
+    await s1Page.selectOption("#student-section", "10-Rizal");
+    await s1Page.getByRole("button", { name: /Enter Waiting Room/i }).click();
 
-    // 3. GO COMPLETELY OFFLINE BEFORE STUDY + QUIZ
-    await context.setOffline(true);
-    await page.evaluate(() => window.dispatchEvent(new Event("offline")));
+    await s2Page.fill("#student-full-name", "Carlo Reyes");
+    await s2Page.selectOption("#student-section", "10-Bonifacio");
+    await s2Page.getByRole("button", { name: /Enter Waiting Room/i }).click();
 
-    // Verify Week 1 Study Module end-to-end including Scenario MCQs (regresses salt bug!)
-    await page.locator("button:has-text('G10 Topics')").click();
-    await page.locator("button:has-text('Rational Exponents & Radicals')").click();
-    await page.locator("button:has-text('Continue to Matching Activity')").click();
+    await expect(s1Page.getByText(/Waiting Room — Questions Are Locked/i)).toBeVisible();
+    await expect(s2Page.getByText(/Waiting Room — Questions Are Locked/i)).toBeVisible();
 
-    // Complete all 4 Week 1 matches (MathText renders √ and superscripts cleanly)
-    const pairs: [RegExp, RegExp][] = [
-      [/√49a/, /^7a3b2$/],
-      [/81m/, /^3m2n3$/],
-      [/27x/, /^3x3y$/],
-      [/^82\/3$/, /^4$/],
-    ];
-    for (const [leftRe, rightRe] of pairs) {
-      await page.locator("button", { hasText: leftRe }).first().click();
-      await page.locator("button", { hasText: rightRe }).first().click();
-    }
-    await page.locator("button:has-text('Proceed to Quantitative Practice')").click();
+    // 4. Cut internet on BOTH student devices AND verify quiz questions stay unreadable
+    await student1Ctx.setOffline(true);
+    await student2Ctx.setOffline(true);
+    await expect(s1Page.getByTestId("quiz-timer")).toHaveCount(0);
+    await expect(s1Page.getByRole("button", { name: /Finish & Generate File/i })).toHaveCount(0);
 
-    // Solve numeric practice checks (9 and 8; Check changes to Done once solved)
-    const numInputs = page.locator("input[placeholder='Numeric answer']");
-    await numInputs.nth(0).fill("9");
-    await numInputs.nth(1).fill("8");
-    await page.locator("button:has-text('Check')").first().click();
-    await expect(page.locator("button:has-text('Done')")).toHaveCount(1);
-    await page.locator("button:has-text('Check')").first().click();
-    await expect(page.locator("button:has-text('Done')")).toHaveCount(2);
-    await expect(page.locator("body")).toContainText("Correct (+5 pts).");
-    await page.locator("button:has-text('Proceed to Word Problem')").click();
+    // Wrong Start Code is rejected
+    await s1Page.fill("#start-code-input", "22222-33333");
+    await s1Page.getByRole("button", { name: /Unlock Quiz/i }).click();
+    await expect(s1Page.getByText(/Wrong or tampered Start Code/i)).toBeVisible();
 
-    // Confirm applied scenario MCQ options grade CORRECTLY!
-    await page.locator("button", { hasText: /^12x2y3 m$/ }).click();
-    await expect(page.locator("body")).toContainText("Correct (+10 pts).");
-    await page.locator("button:has-text('Next Question')").click();
-    await page.locator("button", { hasText: /^20√2 m$/ }).click();
-    await expect(page.locator("body")).toContainText("Correct (+10 pts).");
+    // 5. Teacher clicks START QUIZ -> gets 10-char signed Start Code
+    await teacherPage.getByTestId("teacher-start-btn").click();
+    const startCodeEl = teacherPage.getByTestId("teacher-start-code");
+    await expect(startCodeEl).toBeVisible();
+    const startCode = (await startCodeEl.textContent())?.trim() || "";
+    expect(startCode).toMatch(/^[2-9A-Z]{5}-[2-9A-Z]{5}$/);
 
-    await page.locator("button:has-text('All Topics')").click();
-    await page.locator("button:has-text('Quizzes')").click();
+    // 6. Both students unlock OFFLINE using Start Code
+    await s1Page.fill("#start-code-input", startCode);
+    await s2Page.fill("#start-code-input", startCode);
+    await Promise.all([
+      s1Page.getByRole("button", { name: /Unlock Quiz/i }).click(),
+      s2Page.getByRole("button", { name: /Unlock Quiz/i }).click(),
+    ]);
 
-    // Start encrypted 5-item Quick Checkpoint pack offline
-    const quickCard = page
-      .locator(".qg-card", { hasText: "Quick Checkpoint (5 Items)" })
-      .first();
-    await quickCard.locator("button:has-text('Start Quiz')").click();
-    await page.waitForURL("**/student/play**");
+    await expect(s1Page.getByTestId("quiz-timer")).toBeVisible();
+    await expect(s2Page.getByTestId("quiz-timer")).toBeVisible();
 
-    // 4. Answer all 5 encrypted questions accurately offline (answers: B, C, B, C, B)
-    const correctLetters = ["B", "C", "B", "C", "B"];
-    for (let i = 0; i < 5; i++) {
-      await expect(page.locator("body")).toContainText(`Question ${i + 1} of 5`);
-      await page.locator("button", { hasText: new RegExp(`^${correctLetters[i]}`) }).first().click();
+    const parseSec = (txt: string | null) => {
+      const m = (txt || "0:00").trim().match(/(\d+):(\d+)/);
+      return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
+    };
+    const s2BeforeReloadSec = parseSec(await s2Page.getByTestId("quiz-timer").textContent());
 
-      // Should NOT show Incorrect modal when right answer is clicked!
-      await expect(page.locator("div[role='dialog']")).toHaveCount(0);
+    // Attach download listener for Student 2 auto-submit BEFORE waiting for timer expiry
+    const s2DlPromise = s2Page.waitForEvent("download", { timeout: 25000 });
 
-      if (i < 4) {
-        await page.locator("button:has-text('Next Question')").click();
-      } else {
-        await page.locator("button:has-text('Finish & Generate QR')").click();
+    // Student 1 completes answers and manually clicks Finish
+    await s1Page.locator("button:has(strong:text('A.'))").first().click();
+    let s1FilePath = "";
+    for (let step = 0; step < 10; step++) {
+      const finishBtn = s1Page.getByRole("button", { name: /Finish & Generate File/i });
+      if (await finishBtn.isVisible().catch(() => false)) {
+        const dlPromise = s1Page.waitForEvent("download");
+        await finishBtn.click();
+        const dl1 = await dlPromise;
+        s1FilePath = testInfo.outputPath("maria-santos.qres.json");
+        await dl1.saveAs(s1FilePath);
+        await expect(s1Page.getByText(/Send this file to your teacher/i)).toBeVisible();
+        break;
       }
+      await s1Page.getByRole("button", { name: /^Next$/i }).click();
     }
+    expect(s1FilePath).not.toBe("");
 
-    // 5. Verify 5 / 5 perfect score and signed Result QR pass
-    await expect(page.locator("body")).toContainText("5 / 5");
-    await expect(page.locator("canvas[aria-label='Verified Result QR Pass']")).toBeVisible();
-    const resultQrCode = (await page.locator("code").last().textContent())?.trim() || "";
-    expect(resultQrCode).toMatch(/^QG1O\./);
+    // Student 2 reloads offline mid-attempt -> verify cached page works offline AND timer was NOT reset
+    await s2Page.waitForTimeout(1200);
+    await s2Page.reload();
+    await expect(s2Page.getByTestId("quiz-timer")).toBeVisible();
+    const s2AfterReloadSec = parseSec(await s2Page.getByTestId("quiz-timer").textContent());
+    expect(s2AfterReloadSec).toBeLessThanOrEqual(s2BeforeReloadSec);
 
-    // 6. Reload completely OFFLINE & confirm Service Worker + IndexedDB persist cleanly
-    await page.reload();
-    await expect(page.locator("canvas[aria-label='Verified Result QR Pass']")).toBeVisible();
+    // Wait for Student 2's 15-second timer to expire -> auto-submits & triggers download once
+    const dl2 = await s2DlPromise;
+    const s2FilePath = testInfo.outputPath("carlo-reyes.qres.json");
+    await dl2.saveAs(s2FilePath);
+    await expect(s2Page.getByText(/Send this file to your teacher/i)).toBeVisible();
 
-    // 7. Open /verify while STILL OFFLINE and authenticate Result QR
-    await page.goto("/verify");
-    await expect(page.locator("h1")).toContainText("Verify Student Result");
+    // 7. Put Teacher COMPLETELY OFFLINE too, multi-upload BOTH .qres.json files, verify Roster + CSV
+    await teacherContext.setOffline(true);
+    await teacherPage
+      .getByTestId("teacher-upload-qres")
+      .setInputFiles([s1FilePath, s2FilePath]);
 
-    await page.locator("#manual-qr-input").fill(resultQrCode);
-    await page.locator("button:has-text('Verify Code')").click();
+    await expect(teacherPage.getByText(/\[ACCEPTED\].*maria-santos/i).first()).toBeVisible();
+    await expect(teacherPage.getByText(/\[ACCEPTED\].*carlo-reyes/i).first()).toBeVisible();
+    await expect(teacherPage.getByRole("cell", { name: "Maria Santos" })).toBeVisible();
+    await expect(teacherPage.getByRole("cell", { name: "Carlo Reyes" })).toBeVisible();
 
-    await expect(page.locator("body")).toContainText("Valid Student Result");
-    await expect(page.locator("body")).toContainText("Luna, Antonio M.");
-    await expect(page.locator("body")).toContainText("5/5");
-    await expect(page.locator("body")).toContainText("Offline Signature Verifier");
+    const csvDlPromise = teacherPage.waitForEvent("download");
+    await teacherPage.getByTestId("export-link-csv-btn").click();
+    const csvDl = await csvDlPromise;
+    const csvPath = testInfo.outputPath("class-results.csv");
+    await csvDl.saveAs(csvPath);
+    const csvBody = fs.readFileSync(csvPath, "utf8");
+    expect(csvBody).toContain("Maria Santos");
+    expect(csvBody).toContain("Carlo Reyes");
+    expect(csvBody).toContain("10-Rizal");
+    expect(csvBody).toContain("10-Bonifacio");
 
-    // 8. Reconnect online and verify again via Serverless API
-    await context.setOffline(false);
-    await page.evaluate(() => window.dispatchEvent(new Event("online")));
-    await page.locator("button:has-text('Verify Code')").click();
-
-    await expect(page.locator("body")).toContainText("Serverless Verifier API");
+    await student1Ctx.close();
+    await student2Ctx.close();
+    await teacherContext.setOffline(false);
   });
 
-  test("teacher registers (no email), creates class, starts live offline run, sees newly registered student in roster, and collects separate-phone student Result QR", async ({
+  test("Grade 10 Study Track and /verify page work offline cleanly", async ({
+    context,
     page,
-    browser,
   }) => {
-    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto("/student");
+    await expect(page.getByRole("heading", { name: /Student Workspace/i })).toBeVisible();
 
-    // 1. Register Teacher account using string username only (zero email)
-    await page.goto("/auth?role=teacher&tab=register");
-    await page.locator("input[placeholder*='Lyn Dioso']").fill("Ms. Rivera");
-    await page.locator("input[placeholder*='teacher_dioso']").fill("teacher_rivera");
-    await page.locator("input[placeholder='Password']").fill("securepass123");
-    await page.locator("button:has-text('Register Teacher Account')").click();
+    // Pre-cache /verify route while online via navigation
+    await page.goto("/verify");
+    await expect(page.getByRole("heading").first()).toBeVisible();
 
-    await page.waitForURL("**/teacher");
-    await expect(page.locator("h1")).toContainText("Teacher Console · Ms. Rivera");
+    await page.goto("/student");
+    await page.getByRole("button", { name: /G10 Topics/i }).click();
+    await expect(page.getByText(/Grade 10 Quarter 2 Math Track/i)).toBeVisible();
 
-    // 2. Create class -> capture Join Code
-    await page.locator("input[placeholder*='Grade 10 - Rizal']").fill("Grade 10 - Rizal");
-    await page.locator("button:has-text('Create Class')").click();
-    await expect(page.locator("h2", { hasText: "Grade 10 - Rizal" })).toBeVisible();
-    const joinCode = (
-      await page.locator("p:has-text('Student Join Code:') code").textContent()
-    )?.trim() || "";
-    expect(joinCode.length).toBeGreaterThanOrEqual(4);
+    // Wait briefly for SW to claim page, then test offline navigation cleanly
+    await page.waitForTimeout(400);
+    await context.setOffline(true);
 
-    // 3. Load Grade 10 checkpoint quiz & Start Run -> must immediately show Live Run Dashboard + Classroom Quiz QR
-    await page.getByRole("button", { name: /^Quizzes/ }).click();
-    await page.locator("button:has-text('Quick Checkpoint (5 Items)')").click();
-    await page.locator("button:has-text('Start Run')").first().click();
+    await page.getByRole("button", { name: /Week 1 · Topic A/i }).click();
+    await page.getByRole("button", { name: /Continue to Matching Activity/i }).click();
+    await expect(page.getByText(/Match Equivalent Expressions/i)).toBeVisible();
 
-    await expect(page.locator("body")).toContainText("Live Run Active");
-    await expect(page.locator("canvas[aria-label='Classroom Quiz QR']")).toBeVisible();
-    const classroomQuizQrPayload =
-      (
-        await page
-          .locator("code", { hasText: /^QPK[01]\./ })
-          .first()
-          .textContent()
-      )?.trim() || "";
-    expect(classroomQuizQrPayload).toMatch(/^QPK[01]\./);
-
-    // 4. Same-device Student registers using Teacher's Join Code -> answers 5/5 -> auto-enrolls & updates roster
-    await page.goto(`/auth?role=student&tab=register&join=${encodeURIComponent(joinCode)}`);
-    await page.locator("input[placeholder*='Dela Cruz']").fill("Dela Cruz, Mateo");
-    await page.locator("input[placeholder='2026-0001']").fill("2026-0777");
-    await page.locator("input[placeholder='Enter PIN or password']").fill("123456");
-    await page.locator("button:has-text('Create Student Account & QR Pass')").click();
-    await page.locator("button:has-text('Continue to Student Workspace')").click();
-    await page.waitForURL("**/student");
-
-    await expect(page.locator("body")).toContainText("Teacher Started Classroom Quiz · Grade 10 - Rizal");
-    await page.locator("button:has-text('Start Classroom Quiz')").click();
-    await page.waitForURL("**/student/play**");
-
-    const letters = ["B", "C", "B", "C", "B"];
-    for (let i = 0; i < 5; i++) {
-      await page.locator("button", { hasText: new RegExp(`^${letters[i]}`) }).first().click();
-      if (i < 4) await page.locator("button:has-text('Next Question')").click();
-      else await page.locator("button:has-text('Finish & Generate QR')").click();
-    }
-    await expect(page.locator("body")).toContainText("5 / 5");
-
-    // 5. Simulate a SECOND separate phone offline (isolated browser context!) scanning Teacher's Quiz QR & scoring 4/5
-    const phone2Ctx = await browser.newContext();
-    const phone2Page = await phone2Ctx.newPage();
-    await phone2Page.goto("/auth?role=student&tab=register&join=SELF");
-    await phone2Page.locator("input[placeholder*='Dela Cruz']").fill("Santos, Ana");
-    await phone2Page.locator("input[placeholder='2026-0001']").fill("2026-0888");
-    await phone2Page.locator("input[placeholder='Enter PIN or password']").fill("654321");
-    await phone2Page.locator("button:has-text('Create Student Account & QR Pass')").click();
-    await phone2Page.locator("button:has-text('Continue to Student Workspace')").click();
-    await phone2Page.waitForURL("**/student");
-
-    await phone2Ctx.setOffline(true);
-    await phone2Page.locator("button:has-text('Scan Quiz QR')").click();
-    await phone2Page.locator("input[placeholder*='QPK1']").fill(classroomQuizQrPayload);
-    await phone2Page.locator("button:has-text('Load')").first().click();
-
-    await phone2Page.locator(".qg-card", { hasText: "Quick Checkpoint (5 Items)" }).first().locator("button:has-text('Start Quiz')").click();
-    await phone2Page.waitForURL("**/student/play**");
-    // Answer 4 right, 1st wrong -> dismiss modal -> 4/5
-    const phone2Letters = ["A", "C", "B", "C", "B"];
-    for (let i = 0; i < 5; i++) {
-      await phone2Page.locator("button", { hasText: new RegExp(`^${phone2Letters[i]}`) }).first().click();
-      const modal = phone2Page.locator("div[role='dialog']");
-      if (await modal.isVisible().catch(() => false)) {
-        await modal.locator("button:has-text('Continue')").click();
-      }
-      if (i < 4) await phone2Page.locator("button:has-text('Next Question')").click();
-      else await phone2Page.locator("button:has-text('Finish & Generate QR')").click();
-    }
-    await expect(phone2Page.locator("body")).toContainText("4 / 5");
-    const anaResultQr = (await phone2Page.locator("code").last().textContent())?.trim() || "";
-    expect(anaResultQr).toMatch(/^QG1O\./);
-    await phone2Ctx.close();
-
-    // 6. Teacher logs back in on Teacher Console -> sees Enrolled Student (NOT 0!), Mateo's 5/5, AND collects Ana's 4/5 Result QR!
-    await page.goto("/auth?role=teacher&tab=login");
-    await page.locator("input[placeholder*='teacher_dioso']").fill("teacher_rivera");
-    await page.locator("input[placeholder='Password']").fill("securepass123");
-    await page.locator("button:has-text('Sign In to Teacher Console')").click();
-    await page.waitForURL("**/teacher");
-
-    await expect(page.locator("body")).toContainText("Enrolled Students (1)");
-    await expect(page.locator("body")).toContainText("Dela Cruz, Mateo");
-
-    await page.getByRole("button", { name: /^Quizzes/ }).click();
-    await expect(page.locator("body")).toContainText("Dela Cruz, Mateo");
-    await expect(page.locator("body")).toContainText("5/5");
-
-    // Collect 2nd phone offline student Result QR directly inside Run Roster
-    await page.locator("input[placeholder*='QG1O']").fill(anaResultQr);
-    await page.locator("button:has-text('Record Score')").click();
-
-    await expect(page.locator("body")).toContainText("2/2 Recorded");
-    await expect(page.locator("body")).toContainText("Santos, Ana");
-    await expect(page.locator("body")).toContainText("4/5");
-
-    // End the Run cleanly
-    await page.locator("button:has-text('End Run')").click();
-    await expect(page.locator("body")).toContainText("Run Ended");
+    await page.goto("/verify");
+    await expect(page.getByRole("heading").first()).toBeVisible();
+    await context.setOffline(false);
   });
 });

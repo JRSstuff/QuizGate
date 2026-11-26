@@ -45,8 +45,9 @@ import {
 } from "@/lib/offline/storage";
 import { calculateRemainingSeconds, formatCountdown } from "@/lib/timer/clockSync";
 import { QrCanvas } from "./QrCanvas";
+import { TeacherLinkPanel } from "./TeacherLinkPanel";
 
-type TeacherTab = "classes" | "quizzes" | "print";
+type TeacherTab = "links" | "classes" | "quizzes" | "print";
 
 interface CloudRunResultRow {
   student_id: string;
@@ -69,7 +70,7 @@ const DEMO_STUDENTS = [
 ];
 
 export function TeacherConsole() {
-  const [tab, setTab] = useState<TeacherTab>("classes");
+  const [tab, setTab] = useState<TeacherTab>("links");
   const [session, setSession] = useState<ActiveSession | null>(null);
   const [classes, setClasses] = useState<LocalTeacherClass[]>([]);
   const [quizzes, setQuizzes] = useState<LocalTeacherQuiz[]>([]);
@@ -1126,7 +1127,17 @@ export function TeacherConsole() {
       )}
 
       {/* Teacher Navigation Tabs */}
-      <div className="grid grid-cols-3 gap-2 p-1.5 qg-card no-print">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 p-1.5 qg-card no-print">
+        <button
+          type="button"
+          onClick={() => setTab("links")}
+          className={`qg-btn text-xs sm:text-sm ${
+            tab === "links" ? "qg-btn-primary" : "bg-transparent text-[var(--ink-muted)]"
+          }`}
+        >
+          <Sparkles className="w-4 h-4" />
+          <span>Quiz Links</span>
+        </button>
         <button
           type="button"
           onClick={() => setTab("classes")}
@@ -1158,6 +1169,10 @@ export function TeacherConsole() {
           <span>QR Sheet</span>
         </button>
       </div>
+
+      {tab === "links" && (
+        <TeacherLinkPanel quizzes={quizzes} classes={classes} />
+      )}
 
       {tab === "classes" && (
         <div className="space-y-4">

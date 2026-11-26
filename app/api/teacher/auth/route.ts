@@ -42,14 +42,10 @@ export async function POST(req: NextRequest) {
 
     const supabase = getSupabaseServiceClient();
     if (!supabase) {
-      return NextResponse.json(
-        {
-          mode: "offline",
-          error:
-            "Server database secret key (SUPABASE_SERVICE_ROLE_KEY) is not set; using local device classroom mode.",
-        },
-        { status: 503 }
-      );
+      return NextResponse.json({
+        mode: "offline",
+        cloud: false,
+      });
     }
 
     const rpcName =
@@ -69,6 +65,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       mode: "supabase",
+      cloud: true,
       session_token: data.session_token,
       teacher: data.teacher,
     });

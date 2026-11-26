@@ -8,6 +8,7 @@ import {
   BookOpen,
   FileKey2,
   GraduationCap,
+  Link2,
   LogIn,
   QrCode,
   ScanLine,
@@ -15,13 +16,17 @@ import {
   UserPlus,
 } from "lucide-react";
 import { decryptQuizPack, type EncryptedQuizPack } from "@/lib/crypto/quizVault";
-import { offlineDb, type ActiveSession } from "@/lib/offline/storage";
+import { offlineDb, type ActiveSession, type LinkStudentAttemptRecord } from "@/lib/offline/storage";
 import { QrCanvas } from "./QrCanvas";
 
 export function HomeScreen() {
   const router = useRouter();
   const [session, setSession] = useState<ActiveSession | null>(null);
-  const [joinCode, setJoinCode] = useState("");
+  const [cachedLinks, setCachedLinks] = useState<
+    { runId: string; title: string; className: string; status?: string; shareUrl: string }[]
+  >([]);
+  const [quizLinkInput, setQuizLinkInput] = useState("");
+  const [linkError, setLinkError] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
   const [showMyQr, setShowMyQr] = useState(false);
@@ -37,6 +42,31 @@ export function HomeScreen() {
           .get("active")
           .then((s) => setSession(s || null))
           .catch(() => {});
+        Promise.all([offlineDb.cachedLinkPacks.toArray(), offlineDb.linkAttempts.toArray()])
+          .then(([packs, atts]) => {
+            const attMap = new Map<string, LinkStudentAttemptRecord>();
+            atts.forEach((a) => attMap.set(a.runId, a));
+            const items = packs.map((p) => {
+              let title = p.runId;
+              let className = "";
+              try {
+                const env = JSON.parse(p.envelopeJson);
+                title = env.title || p.runId;
+                className = env.className || "";
+              } catch {
+                // ignore
+              }
+              return {
+                runId: p.runId,
+                title,
+                className,
+                status: attMap.get(p.runId)?.status,
+                shareUrl: p.shareUrl || `/q/${p.runId}`,
+              };
+            });
+            setCachedLinks(items);
+          })
+          .catch(() => {});
       }
     };
     sync();
@@ -44,11 +74,21 @@ export function HomeScreen() {
     return () => window.removeEventListener("qg:session-updated", sync);
   }, []);
 
-  const handleJoinWithCode = (e: React.FormEvent) => {
+  const handleOpenQuizLink = (e: React.FormEvent) => {
     e.preventDefault();
-    const clean = joinCode.trim().toUpperCase();
-    if (!clean) return;
-    router.push(`/auth?role=student&tab=register&join=${encodeURIComponent(clean)}`);
+    setLinkError(null);
+    const raw = quizLinkInput.trim();
+    if (!raw) return;
+    const qIdx = raw.indexOf("/q/");
+    if (qIdx >= 0) {
+      window.location.assign(raw.slice(qIdx));
+      return;
+    }
+    if (raw.startsWith("L3.")) {
+      setLinkError("Paste the full Quiz Link starting with /q/... from your teacher.");
+      return;
+    }
+    router.push(`/q/${encodeURIComponent(raw)}`);
   };
 
   const handleImportPackFile = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -176,38 +216,55 @@ export function HomeScreen() {
               <div>
                 <h1 className="text-lg font-bold">Student Portal</h1>
                 <p className="text-xs text-[var(--ink-muted)]">
-                  Take classroom quizzes, study Grade 10 Math offline, and earn QR passes
+                  No account or registration needed — open your teacher&apos;s Quiz Link directly or study offline
                 </p>
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-2.5 mt-4">
-              <Link href="/auth?role=student&tab=login" className="qg-btn qg-btn-primary">
-                <LogIn className="w-4 h-4" />
-                <span>Log In</span>
-              </Link>
-              <Link href="/auth?role=student&tab=register" className="qg-btn qg-btn-secondary">
-                <UserPlus className="w-4 h-4" />
-                <span>Register</span>
-              </Link>
-            </div>
+            <form onSubmit={handleOpenQuizLink} className="space-y-2 mt-4">
+              <label
+                htmlFor="home-quiz-link"
+                className="block text-xs font-semibold text-[var(--ink-muted)]"
+              >
+                Open Teacher&apos;s Quiz Link
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="home-quiz-link"
+                  className="qg-input text-xs font-mono"
+                  placeholder="Paste /q/<runId>#... link from teacher"
+                  value={quizLinkInput}
+                  onChange={(e) => setQuizLinkInput(e.target.value)}
+                />
+                <button
+                  type="submit"
+                  disabled={!quizLinkInput.trim()}
+                  className="qg-btn qg-btn-primary shrink-0"
+                >
+                  <Link2 className="w-4 h-4" />
+                  <span>Open</span>
+                </button>
+              </div>
+              {linkError && (
+                <p className="text-xs text-[var(--danger)]">{linkError}</p>
+              )}
+            </form>
           </div>
 
-          <div className="pt-3 border-t border-[var(--border)] flex flex-wrap gap-2">
-            <Link
-              href="/auth?role=student&tab=qr"
-              className="text-xs font-semibold text-[var(--primary)] hover:underline inline-flex items-center gap-1 py-1"
-            >
-              <QrCode className="w-3.5 h-3.5" />
-              <span>Scan Student QR</span>
-            </Link>
-            <span className="text-[var(--border)]">|</span>
+          <div className="pt-3 border-t border-[var(--border)] flex flex-wrap gap-3">
             <Link
               href="/student"
-              className="text-xs font-semibold text-[var(--ink-muted)] hover:text-[var(--ink)] inline-flex items-center gap-1 py-1"
+              className="text-xs font-semibold text-[var(--primary)] hover:underline inline-flex items-center gap-1 py-1"
             >
               <span>Browse Grade 10 Offline Modules</span>
               <ArrowRight className="w-3.5 h-3.5" />
+            </Link>
+            <span className="text-[var(--border)]">|</span>
+            <Link
+              href="/student?tab=results"
+              className="text-xs font-semibold text-[var(--ink-muted)] hover:text-[var(--ink)] inline-flex items-center gap-1 py-1"
+            >
+              <span>Saved Submissions &amp; QR Receipts</span>
             </Link>
           </div>
         </div>
@@ -237,7 +294,7 @@ export function HomeScreen() {
               </Link>
               <Link href="/auth?role=teacher&tab=register" className="qg-btn qg-btn-secondary">
                 <UserPlus className="w-4 h-4" />
-                <span>Register</span>
+                <span>Teacher Register</span>
               </Link>
             </div>
           </div>
@@ -262,38 +319,46 @@ export function HomeScreen() {
         </div>
       </section>
 
-      {/* Join Code & Encrypted Offline Pack Loader */}
+      {/* Cached Offline Runs & Encrypted Offline Pack Loader */}
       <section className="qg-card p-5 space-y-4">
         <div className="flex items-center gap-2">
           <FileKey2 className="w-5 h-5 text-[var(--primary)]" />
-          <h3 className="font-bold text-base">Join Class Link or Load Encrypted Quiz File</h3>
+          <h3 className="font-bold text-base">Saved Offline Quizzes &amp; Encrypted Pack Loader</h3>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <form onSubmit={handleJoinWithCode} className="space-y-2">
-            <label
-              htmlFor="home-join-code"
-              className="block text-xs font-semibold text-[var(--ink-muted)]"
-            >
-              Have a Teacher Class Code?
-            </label>
-            <div className="flex gap-2">
-              <input
-                id="home-join-code"
-                className="qg-input uppercase font-mono tracking-wider"
-                placeholder="e.g. MATH10"
-                value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value)}
-              />
-              <button
-                type="submit"
-                disabled={!joinCode.trim()}
-                className="qg-btn qg-btn-primary shrink-0"
-              >
-                Join
-              </button>
-            </div>
-          </form>
+          <div className="space-y-2">
+            <span className="block text-xs font-semibold text-[var(--ink-muted)]">
+              Cached Quiz Links on This Device
+            </span>
+            {cachedLinks.length === 0 ? (
+              <p className="text-xs text-[var(--ink-muted)] py-2">
+                No cached Quiz Links yet. When you open a teacher&apos;s <code>/q/...</code> link,
+                it caches automatically so you can reopen offline anytime.
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {cachedLinks.map((item) => (
+                  <a
+                    key={item.runId}
+                    href={item.shareUrl}
+                    className="flex items-center justify-between p-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface-subtle)] hover:border-[var(--primary)] text-xs"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-bold truncate">{item.title}</p>
+                      <p className="text-[var(--ink-muted)] truncate">
+                        {item.className ? `${item.className} · ` : ""}
+                        Run {item.runId}
+                      </p>
+                    </div>
+                    <span className="px-2 py-0.5 rounded-full bg-[var(--primary-soft)] text-[var(--primary)] font-semibold shrink-0">
+                      {item.status || "Cached"}
+                    </span>
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
 
           <div className="space-y-2">
             <span className="block text-xs font-semibold text-[var(--ink-muted)]">

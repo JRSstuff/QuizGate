@@ -2,8 +2,10 @@ import Dexie, { type EntityTable } from "dexie";
 import type {
   EncryptedQuizPack,
   OfflineResultPlainPayload,
+  StudentSubmissionAnswer,
   VerifiedResultQr,
 } from "../crypto/quizVault";
+import type { TeacherLinkRunRecord } from "../teacher/submissionMerge";
 
 export interface LocalAccount {
   id: string;
@@ -152,6 +154,48 @@ export interface TeacherVerificationEntry {
   rawCode: string;
 }
 
+/** Link-based student flow IndexedDB records */
+export interface LinkDeviceMeta {
+  key: "device";
+  deviceId: string;
+}
+
+export interface CachedLinkPackRecord {
+  runId: string;
+  versionHash: string;
+  envelopeJson: string;
+  shareUrl: string;
+  cachedAt: string;
+  packVerified: boolean;
+}
+
+export interface LinkStudentAttemptRecord {
+  runId: string;
+  versionHash: string;
+  attemptId: string;
+  deviceId: string;
+  studentName: string;
+  section: string;
+  status: "waiting" | "in_progress" | "submitted";
+  unlocked: boolean;
+  startedAtMs?: number;
+  endsAtMs?: number;
+  lastTickWallMs?: number;
+  accumulatedElapsedMs: number;
+  clockTampered: boolean;
+  answers: Record<string, StudentSubmissionAnswer>;
+  score?: number;
+  maxScore?: number;
+  submittedAt?: string;
+  submittedOffline: boolean;
+  lateAfterEnd: boolean;
+  resultPacketJson?: string;
+  resultQr?: string;
+  autoDownloaded?: boolean;
+  syncedToServer?: boolean;
+  staleVersion?: boolean;
+}
+
 export class QuizGateOfflineDB extends Dexie {
   accounts!: EntityTable<LocalAccount, "id">;
   session!: EntityTable<ActiveSession, "key">;
@@ -163,6 +207,12 @@ export class QuizGateOfflineDB extends Dexie {
   teacherQuizzes!: EntityTable<LocalTeacherQuiz, "id">;
   teacherRuns!: EntityTable<LocalTeacherRun, "id">;
   verificationLogs!: EntityTable<TeacherVerificationEntry, "id">;
+
+  // Link-based QuizGate v3 tables
+  linkDeviceMeta!: EntityTable<LinkDeviceMeta, "key">;
+  cachedLinkPacks!: EntityTable<CachedLinkPackRecord, "runId">;
+  linkAttempts!: EntityTable<LinkStudentAttemptRecord, "runId">;
+  teacherLinkRuns!: EntityTable<TeacherLinkRunRecord, "runId">;
 
   constructor() {
     super("QuizGateOfflineDB_v2");
@@ -188,6 +238,22 @@ export class QuizGateOfflineDB extends Dexie {
       teacherQuizzes: "id, classId, status",
       teacherRuns: "id, quizId, classId, status, startedAt",
       verificationLogs: "++id, scannedAt, studentName, valid",
+    });
+    this.version(3).stores({
+      accounts: "id, role, identifier, classCode",
+      session: "key",
+      importedPacks: "id, importedAt",
+      answerQueue: "++id, attemptId, packOrRunId, questionId, syncStatus",
+      attempts: "id, packOrRunId, studentId, status, syncStatus",
+      studyProgress: "key",
+      teacherClasses: "id, joinCode",
+      teacherQuizzes: "id, classId, status",
+      teacherRuns: "id, quizId, classId, status, startedAt",
+      verificationLogs: "++id, scannedAt, studentName, valid",
+      linkDeviceMeta: "key",
+      cachedLinkPacks: "runId, versionHash",
+      linkAttempts: "runId, attemptId, status",
+      teacherLinkRuns: "runId, quizId, status, createdAtSec",
     });
   }
 }

@@ -451,17 +451,14 @@ export function StudentWorkspace() {
           <p className="text-xs sm:text-sm text-[var(--ink-muted)]">
             {session
               ? `ID ${session.identifier} · ${session.className || session.classCode || "Offline Mode"}`
-              : "Sign in or register to link results to your Student ID, or practice offline right away."}
+              : "Study Grade 10 Math offline, practice self-checks, or open a teacher's Quiz Link (/q/...)."}
           </p>
         </div>
 
         {!session ? (
           <div className="flex gap-2">
-            <Link href="/auth?role=student&tab=login" className="qg-btn qg-btn-secondary text-xs">
-              Log In
-            </Link>
-            <Link href="/auth?role=student&tab=register" className="qg-btn qg-btn-primary text-xs">
-              Register Student ID
+            <Link href="/" className="qg-btn qg-btn-secondary text-xs">
+              Open Quiz Link
             </Link>
           </div>
         ) : (
@@ -846,13 +843,11 @@ export function StudentWorkspace() {
               />
             </div>
           ) : (
-            <div className="qg-card p-5 text-center space-y-3">
+            <div className="qg-card p-5 text-center space-y-2">
               <p className="text-sm text-[var(--ink-muted)]">
-                Register or sign in to generate your personal Student Identity QR card.
+                For link-based class quizzes (<code>/q/...</code>), no registration is needed — open
+                the link shared by your teacher and enter your Full Name and Section.
               </p>
-              <Link href="/auth?role=student&tab=register" className="qg-btn qg-btn-primary text-xs">
-                Register Student ID
-              </Link>
             </div>
           )}
 

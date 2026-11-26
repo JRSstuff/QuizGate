@@ -1,4 +1,4 @@
-const CACHE_NAME = "quizgate-pwa-cache-v3";
+const CACHE_NAME = "quizgate-pwa-cache-v4";
 const PRECACHE_ROUTES = [
   "/",
   "/auth",
@@ -55,6 +55,25 @@ self.addEventListener("message", (event) => {
       )
     );
   }
+
+  // Version-tagged cache update for /q/<runId> student quiz links
+  if (event.data && event.data.type === "CACHE_RUN_ROUTE" && typeof event.data.url === "string") {
+    event.waitUntil(
+      caches.open(CACHE_NAME).then(async (cache) => {
+        try {
+          const res = await fetch(event.data.url, { cache: "reload" });
+          if (res && res.ok) {
+            await cache.put(event.data.url, res.clone());
+            if (event.data.versionHash) {
+              await cache.put(`${event.data.url}?v=${encodeURIComponent(event.data.versionHash)}`, res);
+            }
+          }
+        } catch {
+          // Keep existing cached entry if offline
+        }
+      })
+    );
+  }
 });
 
 self.addEventListener("fetch", (event) => {
@@ -101,7 +120,6 @@ self.addEventListener("fetch", (event) => {
           const pathMatch = await caches.match(url.pathname, { ignoreSearch: true });
           if (pathMatch) return pathMatch;
         } else {
-          // Match cached RSC payload for the pathname regardless of dynamic query params like ?id=...
           const keys = await caches.keys();
           for (const k of keys) {
             const cache = await caches.open(k);
@@ -118,6 +136,10 @@ self.addEventListener("fetch", (event) => {
         }
 
         if (request.mode === "navigate") {
+          if (url.pathname.startsWith("/q/")) {
+            const qExact = await caches.match(url.pathname, { ignoreSearch: true });
+            if (qExact) return qExact;
+          }
           if (url.pathname.startsWith("/student/play")) {
             const playShell = await caches.match("/student/play", { ignoreSearch: true });
             if (playShell) return playShell;

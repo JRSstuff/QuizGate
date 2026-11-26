@@ -40,13 +40,10 @@ export async function POST(req: NextRequest) {
 
       if (parsed.kind === "supabase_qr") {
         if (!supabase) {
-          return NextResponse.json(
-            {
-              error:
-                "Supabase is not configured on this server. Use Offline ID login or register a local pass.",
-            },
-            { status: 503 }
-          );
+          return NextResponse.json({
+            mode: "offline",
+            cloud: false,
+          });
         }
         const { data, error } = await supabase.rpc("student_sign_in", {
           qr_payload: cleanQr,
@@ -79,10 +76,10 @@ export async function POST(req: NextRequest) {
     // Path 2: Credential Sign-In via Class Code + Student No + PIN
     if (body.joinCode && body.studentNo && body.pin) {
       if (!supabase) {
-        return NextResponse.json(
-          { error: "Cloud class lookup unavailable offline; checking local IndexedDB account." },
-          { status: 503 }
-        );
+        return NextResponse.json({
+          mode: "offline",
+          cloud: false,
+        });
       }
       const { data, error } = await supabase.rpc("student_sign_in_with_pin", {
         p_join_code: body.joinCode.trim(),

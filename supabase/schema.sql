@@ -189,6 +189,46 @@ CREATE TABLE IF NOT EXISTS public.teacher_sessions (
   revoked BOOLEAN NOT NULL DEFAULT false
 );
 
+-- 3.13 Optional Link-Based Classroom Run Sync Tables (used when SUPABASE_SERVICE_ROLE_KEY is set)
+CREATE TABLE IF NOT EXISTS public.link_runs (
+  run_id TEXT PRIMARY KEY,
+  version_hash TEXT NOT NULL,
+  class_id TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  quiz_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  duration_minutes INTEGER NOT NULL DEFAULT 15,
+  status TEXT NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting', 'running', 'ended')),
+  created_at_sec BIGINT NOT NULL,
+  started_at_server BIGINT,
+  ends_at_server BIGINT,
+  ended_at_server BIGINT,
+  start_code TEXT,
+  start_qr TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.link_joins (
+  attempt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES public.link_runs(run_id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  student_name TEXT NOT NULL,
+  section TEXT NOT NULL,
+  joined_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.link_submissions (
+  attempt_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES public.link_runs(run_id) ON DELETE CASCADE,
+  packet JSONB NOT NULL,
+  plain JSONB NOT NULL,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.link_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.link_joins ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.link_submissions ENABLE ROW LEVEL SECURITY;
+
 CREATE INDEX IF NOT EXISTS idx_teacher_sessions_teacher_id ON public.teacher_sessions(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_teacher_sessions_token_hash ON public.teacher_sessions(token_hash);
 

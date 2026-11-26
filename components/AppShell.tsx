@@ -33,6 +33,7 @@ export function AppShell({
   const router = useRouter();
   const [isOnline, setIsOnline] = useState(true);
   const [swReady, setSwReady] = useState(false);
+  const [cloudMode, setCloudMode] = useState<"offline" | "supabase">("offline");
   const [canInstall, setCanInstall] = useState(false);
   const [isDark, setIsDark] = useState(false);
   const [session, setSession] = useState<ActiveSession | null>(null);
@@ -43,6 +44,13 @@ export function AppShell({
     if ("serviceWorker" in navigator && navigator.serviceWorker.controller) {
       setSwReady(true);
     }
+    fetch("/api/health")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && d.mode === "supabase") setCloudMode("supabase");
+        else setCloudMode("offline");
+      })
+      .catch(() => setCloudMode("offline"));
 
     try {
       const savedTheme = localStorage.getItem("qg_theme");
@@ -183,7 +191,18 @@ export function AppShell({
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {/* Offline / Online indicator */}
+            {/* Offline / Online & Mode indicator */}
+            <div
+              className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-[var(--surface-subtle)] border border-[var(--border)] text-[var(--ink-muted)]"
+              title={
+                cloudMode === "supabase"
+                  ? "Optional Supabase cloud sync enabled"
+                  : "Classroom Offline Mode — all quiz runs work without Supabase cloud"
+              }
+            >
+              <span>{cloudMode === "supabase" ? "Cloud Sync Ready" : "Classroom Offline Mode"}</span>
+            </div>
+
             <div
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-semibold border ${
                 isOnline
@@ -243,10 +262,10 @@ export function AppShell({
               </button>
             ) : (
               <Link
-                href="/auth"
+                href="/auth?role=teacher&tab=login"
                 className="inline-flex items-center justify-center px-3 h-10 rounded-xl bg-[var(--primary)] text-white text-xs font-semibold hover:bg-[var(--primary-hover)]"
               >
-                Sign In
+                Teacher Sign In
               </Link>
             )}
           </div>
