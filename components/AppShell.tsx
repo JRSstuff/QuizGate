@@ -166,7 +166,7 @@ export function AppShell({
             </Link>
 
             <nav
-              className="hidden sm:flex items-center gap-1"
+              className="hidden lg:flex items-center gap-1"
               aria-label="Primary navigation"
             >
               {navItems.map((item) => {
@@ -193,7 +193,7 @@ export function AppShell({
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             {/* Offline / Online & Mode indicator */}
             <div
-              className="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-[var(--surface-subtle)] border border-[var(--border)] text-[var(--ink-muted)]"
+              className="hidden xl:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-[var(--surface-subtle)] border border-[var(--border)] text-[var(--ink-muted)]"
               title={
                 cloudMode === "supabase"
                   ? "Optional Supabase cloud sync enabled"
